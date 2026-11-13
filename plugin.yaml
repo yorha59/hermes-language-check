@@ -1,0 +1,7 @@
+name: language_check
+version: "0.1.0"
+description: "Check final replies against profile language discipline and rewrite violations, failing open."
+provides_hooks:
+  - transform_llm_output
+  - pre_llm_call
+  - post_compaction
