@@ -495,3 +495,121 @@ def test_compaction_uses_percentage_and_hard_cap(plugin, caplog, settings, warni
     plugin[0].joinpath('language-rules-dynamic.md').write_text('规' * 100)
     plugin[1].invoke_hook('post_compaction', session_id='s')
     assert any('dynamic-rules-over-budget' in r.message for r in caplog.records) is warning
+
+
+@pytest.mark.parametrize("model, disabled, thinking", [
+    ("GLM-test", True, True), ("gpt-test", True, False), ("glm-test", False, False),
+])
+def test_provider_registry_and_thinking(plugin, monkeypatch, model, disabled, thinking):
+    from providers.base import ProviderProfile
+    import providers
+    registry = Mock(return_value=ProviderProfile(name="example", base_url="https://provider.test/v1",
+                                                env_vars=("EXAMPLE_KEY",)))
+    monkeypatch.setattr(providers, "get_provider_profile", registry)
+    monkeypatch.setattr(plugin[2], "get_secret", Mock(return_value="provider-key"))
+    plugin[3].return_value = response("ok")
+    diagnostic = {}
+    assert plugin[2]._call(model, 1, "check", {}, judge_provider="example",
+                           disable_thinking=disabled, event=diagnostic) == "ok"
+    assert diagnostic["key_source"] == "secret:EXAMPLE_KEY"
+    assert ("thinking" in plugin[3].call_args.kwargs["json"]) is thinking
+    assert plugin[3].call_args.args == ("https://provider.test/v1/chat/completions",)
+    assert plugin[3].call_args.kwargs["headers"]["Authorization"] == "Bearer provider-key"
+    registry.assert_called_once_with("example")
+
+
+@pytest.mark.parametrize("credential", ["api_key: plain-key", "key_env: CUSTOM_KEY"])
+def test_provider_config_for_judge_and_rewrite(plugin, monkeypatch, credential):
+    import providers
+    monkeypatch.setattr(providers, "get_provider_profile", Mock(return_value=None))
+    monkeypatch.setattr(plugin[2], "get_secret", Mock(return_value="plain-key"))
+    plugin[0].joinpath("config.yaml").write_text(
+        f"providers:\n  custom-test:\n    api: https://custom.test/v1\n    {credential}\n"
+        "plugins:\n  enabled: [language_check]\n  entries:\n    language_check:\n"
+        "      settings:\n        judge_provider: custom-test\n        judge_model: gpt-test\n")
+    plugin[3].side_effect = [verdict(True), response("改写")]
+    assert invoke(plugin) == "改写"
+    assert event(plugin)["key_source"] == ("inline" if credential.startswith("api_key:") else "secret:CUSTOM_KEY")
+    for call in plugin[3].call_args_list:
+        assert call.args == ("https://custom.test/v1/chat/completions",)
+        assert call.kwargs["json"]["model"] == "gpt-test"
+        assert "thinking" not in call.kwargs["json"]
+        assert call.kwargs["headers"]["Authorization"] == "Bearer plain-key"
+
+
+def test_no_configuration_disables_judge(plugin, monkeypatch, caplog):
+    monkeypatch.delenv("ZAI_API_KEY")
+    monkeypatch.setattr(plugin[2], "get_secret", Mock(return_value=None))
+    assert invoke(plugin) is None
+    plugin[3].assert_not_called()
+    assert event(plugin)["key_source"] == "missing"
+    assert event(plugin)["skipped"] == "judge_unconfigured"
+    assert "judge disabled" in caplog.text
+
+
+@pytest.mark.parametrize('name,base,mode', [
+    ('zai', 'https://api.z.ai/api/coding/paas/v4', 'chat_completions'),
+    ('kimi-coding', 'https://api.kimi.com/coding/', 'anthropic_messages'),
+])
+def test_custom_provider_overrides_builtin(plugin, monkeypatch, name, base, mode):
+    import yaml
+    plugin[0].joinpath('config.yaml').write_text(yaml.safe_dump({'custom_providers': [
+        dict(name=name, base_url=base, api_key='inline-key', api_mode=mode)]}))
+    assert plugin[2]._provider_connection(name) == (base, 'inline-key', 'inline', mode)
+
+
+@pytest.mark.parametrize('source', ['inline', 'explicit_env', 'provider_env', 'secret'])
+def test_custom_credential_chain(plugin, monkeypatch, source):
+    import yaml
+    for variable in ('GLM_API_KEY', 'ZAI_API_KEY', 'Z_AI_API_KEY', 'CUSTOM_JUDGE_KEY'):
+        monkeypatch.delenv(variable, raising=False)
+    secret = Mock(return_value='secret-key')
+    monkeypatch.setattr(plugin[2], 'get_secret', secret)
+    entry = dict(name='zai', base_url='https://custom.test/v4', api_key='',
+                 api_key_env='CUSTOM_JUDGE_KEY')
+    if source == 'inline':
+        entry['api_key'] = 'inline-key'
+    if source in ('inline', 'explicit_env'):
+        monkeypatch.setenv('CUSTOM_JUDGE_KEY', 'explicit-key')
+    if source != 'secret':
+        monkeypatch.setenv('ZAI_API_KEY', 'provider-key')
+    plugin[0].joinpath('config.yaml').write_text(yaml.safe_dump({'custom_providers': [entry]}))
+    expected = {'inline': ('inline-key', 'inline'), 'explicit_env': ('explicit-key', 'environ:CUSTOM_JUDGE_KEY'),
+                'provider_env': ('provider-key', 'environ:ZAI_API_KEY'), 'secret': ('secret-key', 'secret:CUSTOM_JUDGE_KEY')}
+    assert plugin[2]._provider_connection('zai')[1:3] == expected[source]
+    assert secret.call_count == (1 if source == 'secret' else 0)
+
+
+@pytest.mark.parametrize('mode', ['chat_completions', 'anthropic_messages'])
+def test_custom_wire_protocol(plugin, mode):
+    import yaml
+    plugin[0].joinpath('config.yaml').write_text(yaml.safe_dump({'custom_providers': [
+        dict(name='custom-wire', base_url='https://custom.test/coding/', api_key='key', api_mode=mode)]}))
+    plugin[3].return_value = (response('firstsecond') if mode == 'chat_completions' else
+        httpx.Response(200, json={'content': [{'type': 'text', 'text': 'first'},
+            {'type': 'thinking', 'thinking': 'ignored'}, {'type': 'text', 'text': 'second'}]}))
+    diagnostic = {}
+    assert plugin[2]._call('glm-test', 2, 'system prompt', {'input': '中文'},
+                           max_tokens=123, judge_provider='custom-wire', event=diagnostic) == 'firstsecond'
+    assert plugin[3].call_count == 1
+    call = plugin[3].call_args
+    body = call.kwargs['json']
+    assert call.kwargs['timeout'] == 2
+    assert body['model'] == 'glm-test' and body['max_tokens'] == 123
+    user = {'role': 'user', 'content': json.dumps({'input': '中文'}, ensure_ascii=False)}
+    if mode == 'anthropic_messages':
+        assert call.args == ('https://custom.test/coding/v1/messages',)
+        assert call.kwargs['headers'] == {'x-api-key': 'key', 'anthropic-version': '2023-06-01'}
+        assert body == dict(model='glm-test', max_tokens=123, system='system prompt', messages=[user])
+    else:
+        assert call.args == ('https://custom.test/coding/chat/completions',)
+        assert call.kwargs['headers'] == {'Authorization': 'Bearer key'}
+        assert body['messages'] == [{'role': 'system', 'content': 'system prompt'}, user]
+        assert body['thinking'] == {'type': 'disabled'}
+
+
+def test_custom_miss_falls_back_builtin(plugin):
+    plugin[0].joinpath('config.yaml').write_text('custom_providers:\n  - name: other\n    base_url: https://other.test\n')
+    base, key, source, mode = plugin[2]._provider_connection('zai')
+    assert base == 'https://api.z.ai/api/paas/v4'
+    assert (key, source, mode) == ('test-key', 'environ:ZAI_API_KEY', 'chat_completions')

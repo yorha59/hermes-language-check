@@ -41,29 +41,49 @@ def _provider_connection(name):
     from hermes_cli.config import load_config_readonly
     from providers import get_provider_profile
 
+    config = load_config_readonly()
+    wanted = name.strip().lower()
+    custom = config.get("custom_providers", [])
+    entry = next((item for item in custom if isinstance(item, dict)
+                  and str(item.get("name", "")).strip().lower() == wanted), None)
+    if entry is None:
+        entry = next((value for key, value in config.get("providers", {}).items()
+                      if key.strip().lower() == wanted), {})
     profile = get_provider_profile(name)
-    entries = load_config_readonly().get("providers", {})
-    entry = next((value for key, value in entries.items()
-                  if key.lower() == name.lower()), {})
-    base = entry.get("api") or entry.get("url") or entry.get("base_url")
+    base = entry.get("base_url") or entry.get("api") or entry.get("url")
     base = base or (profile.base_url if profile else "")
-    key = entry.get("api_key")
-    key_env = entry.get("key_env") or entry.get("api_key_env")
-    names = (key_env,) if key_env else (profile.env_vars if profile else ())
-    if not key:
-        key = next((value for variable in names if (value := get_secret(variable))), None)
-    if not base or not key:
+    mode = entry.get("api_mode") or (profile.api_mode if profile else "chat_completions")
+    key, source = _provider_key(name, entry, profile)
+    is_local = "localhost" in (base or "") or "127.0.0.1" in (base or "")
+    if not base or (not key and not is_local):
         raise ValueError(f"Missing endpoint or credential for language check provider {name}")
-    return base, key, "provider:" + name
+    return base, key, source, mode
+
+
+def _provider_key(name, entry, profile):
+    if entry.get("api_key"):
+        return entry["api_key"], "inline"
+    key_env = entry.get("api_key_env") or entry.get("key_env")
+    derived = name.strip().upper().replace("-", "_") + "_API_KEY"
+    names = tuple(dict.fromkeys(((key_env,) if key_env else ())
+                               + (profile.env_vars if profile else ()) + (derived,)))
+    for variable in names:
+        if key := os.environ.get(variable):
+            return key, "environ:" + variable
+    for variable in names:
+        if key := get_secret(variable):
+            return key, "secret:" + variable
+    return None, "missing"
 
 
 def _call(model, timeout, system, data, *, max_tokens=512, event=None,
           judge_provider="", disable_thinking=True):
     if judge_provider:
-        base_url, api_key, key_source = _provider_connection(judge_provider)
+        base_url, api_key, key_source, api_mode = _provider_connection(judge_provider)
         prefix = judge_provider + "/"
         model_name = model[len(prefix):] if model.startswith(prefix) else model
     else:
+        api_mode = "chat_completions"
         provider, separator, model_name = model.partition("/")
         if not separator or not model_name:
             raise ValueError("Expected provider/model for language check")
@@ -86,14 +106,23 @@ def _call(model, timeout, system, data, *, max_tokens=512, event=None,
     body = {"model": model_name, "max_tokens": max_tokens,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": json.dumps(data, ensure_ascii=False)}]}
-    if disable_thinking and "glm" in model_name.lower():
+    headers = {"Authorization": "Bearer " + api_key}
+    endpoint = base_url.rstrip("/") + "/chat/completions"
+    if api_mode == "anthropic_messages":
+        base = base_url.rstrip("/")
+        endpoint = base + ("/messages" if base.endswith("/v1") else "/v1/messages")
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+        body["system"] = system
+        body["messages"] = body["messages"][1:]
+    elif api_mode != "chat_completions":
+        raise ValueError(f"Unsupported language check api_mode: {api_mode}")
+    if api_mode == "chat_completions" and disable_thinking and "glm" in model_name.lower():
         body["thinking"] = {"type": "disabled"}
     started = monotonic()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="language-check")
     try:
         future = executor.submit(copy_context().run, partial(httpx.post,
-            base_url.rstrip("/") + "/chat/completions",
-            headers={"Authorization": "Bearer " + api_key}, timeout=float(timeout),
+            endpoint, headers=headers, timeout=float(timeout),
             json=body,
         ))
         response = future.result(timeout=max(0, float(timeout) - (monotonic() - started)))
@@ -102,7 +131,12 @@ def _call(model, timeout, system, data, *, max_tokens=512, event=None,
     if response.status_code != 200:
         response.raise_for_status()
         raise ValueError("Unexpected language check HTTP status")
-    text = response.json()["choices"][0]["message"]["content"]
+    payload = response.json()
+    if api_mode == "anthropic_messages":
+        text = "".join(block["text"] for block in payload["content"]
+                       if block.get("type") == "text")
+    else:
+        text = payload["choices"][0]["message"]["content"]
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Empty language check response")
     return text
