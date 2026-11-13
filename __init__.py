@@ -98,7 +98,8 @@ def _call(model, timeout, system, data, *, max_tokens=512, event=None,
         base_url = os.environ.get("LANGUAGE_CHECK_LLM_BASE_URL") or "https://api.z.ai/api/coding/paas/v4"
     if event is not None:
         event["key_source"] = key_source
-    if not api_key:
+    is_local = "localhost" in base_url or "127.0.0.1" in base_url
+    if not api_key and not is_local:
         if event is not None:
             event["skipped"] = "judge_unconfigured"
         logger.warning("Language check judge disabled: Missing ZAI_API_KEY or judge_provider configuration")
@@ -106,7 +107,7 @@ def _call(model, timeout, system, data, *, max_tokens=512, event=None,
     body = {"model": model_name, "max_tokens": max_tokens,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": json.dumps(data, ensure_ascii=False)}]}
-    headers = {"Authorization": "Bearer " + api_key}
+    headers = {"Authorization": "Bearer " + api_key} if api_key else {}
     endpoint = base_url.rstrip("/") + "/chat/completions"
     if api_mode == "anthropic_messages":
         base = base_url.rstrip("/")
@@ -136,7 +137,11 @@ def _call(model, timeout, system, data, *, max_tokens=512, event=None,
         text = "".join(block["text"] for block in payload["content"]
                        if block.get("type") == "text")
     else:
-        text = payload["choices"][0]["message"]["content"]
+        message = payload["choices"][0]["message"]
+        text = message.get("content") or ""
+        if not text.strip() and message.get("reasoning"):
+            # Thinking models (e.g. ollama gemma/qwen) may put everything in reasoning.
+            text = message["reasoning"]
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Empty language check response")
     return text
