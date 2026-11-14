@@ -20,12 +20,14 @@ from hermes_constants import get_hermes_home
 from hermes_cli.config_backend import ConfigBackendUnavailable
 
 from .pg_events import EventStore
+from . import jev_shadow
 
 logger = logging.getLogger(__name__)
 _store = EventStore()
 _DEFAULTS = dict(enabled=True, min_chars=20, judge_timeout_ms=12000, rewrite_timeout_s=8,
                  inject_budget_percent=5.0, inject_max_chars=0, context_window_tokens=128000,
-                 judge_provider="", disable_thinking=True, log_path="", judge_model="zai/glm-5.3-flash", rewrite_model="")
+                 jev_training_enabled=False, jev_shadow_enabled=False, jev_model="jev-1.14", jev_timeout_ms=3000,
+                 jev_confidence_threshold=0.75, judge_provider="", disable_thinking=True, log_path="", judge_model="zai/glm-5.3-flash", rewrite_model="")
 
 
 def _log(path, event):
@@ -81,10 +83,10 @@ def _call(model, timeout, system, data, *, max_tokens=512, event=None,
     if judge_provider:
         base_url, api_key, key_source, api_mode = _provider_connection(judge_provider)
         prefix = judge_provider + "/"
-        model_name = model[len(prefix):] if model.startswith(prefix) else model
+        model_name = model.removeprefix(prefix)
     else:
         api_mode = "chat_completions"
-        provider, separator, model_name = model.partition("/")
+        _provider, separator, model_name = model.partition("/")
         if not separator or not model_name:
             raise ValueError("Expected provider/model for language check")
         api_key = os.environ.get("ZAI_API_KEY")
@@ -206,6 +208,11 @@ def _check(text, config, event):
         raise ValueError("Language discipline file is empty")
     judge_rules = _judge_rules(rules, Path(get_hermes_home()))
     event["rules_chars"] = len(judge_rules)
+    if config["jev_training_enabled"]:
+        event["jev_training_status"] = "pending"
+        event["_jev_training"] = jev_shadow.start_training(judge_rules, text, config)
+    elif config["jev_shadow_enabled"]:
+        event["_jev_rules"] = judge_rules
     if not judge_rules:
         raise ValueError("No numbered language discipline rules")
     started = monotonic()
@@ -244,13 +251,13 @@ def _on_transform(response_text="", session_id="", platform="", turn_id="", *, c
                      rewritten=False, reply_chars=len(response_text), judge_ms=0, rewrite_ms=0,
                      error=None, reply_text=response_text, model=_.get("model"),
                      recheck_skipped=False, wall_ms=0, py=sys.executable, pg_error=None,
-                     key_source="missing", rules_chars=0)
+                     key_source="missing", rules_chars=0, **jev_shadow.empty_fields())
         config = {key: ctx.get_config(key, default) for key, default in _DEFAULTS.items()}
         path = Path(config["log_path"]).expanduser() if config["log_path"] else path
         if not config["enabled"]:
             event["skipped"] = "disabled"
             return None
-        if len(response_text) < int(config["min_chars"]):
+        if not config["jev_training_enabled"] and len(response_text) < int(config["min_chars"]):
             event["skipped"] = "min_chars"
             return None
         return _check(response_text, config, event)
@@ -261,10 +268,16 @@ def _on_transform(response_text="", session_id="", platform="", turn_id="", *, c
         return None
     finally:
         if event is not None and path is not None:
+            training = event.pop("_jev_training", None)
+            shadow_rules = event.pop("_jev_rules", None)
             event["wall_ms"] = (monotonic() - started) * 1000
             event["pg_error"] = _store.write(event, started=started)
             event["wall_ms"] = (monotonic() - started) * 1000
             _log(path, event)
+            if training is not None:
+                jev_shadow.collect_training(training, dict(event), path, _log)
+            if shadow_rules:
+                jev_shadow.schedule(shadow_rules, response_text, config, dict(event), path, _log)
 
 
 # Key by profile path so one process can serve independent rule files.

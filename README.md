@@ -211,3 +211,118 @@ window nor an agent reference, so both hooks use the configurable
 `context_window_tokens` fallback. Set it to the model window when known.
 `inject_max_chars` optionally caps this budget; zero or omission means no hard cap.
 Warnings report `window_tokens` and the effective `budget_chars` after the cap.
+
+## Jev shadow comparison
+
+Optional settings under `plugins.entries.language_check.settings`:
+
+```yaml
+jev_shadow_enabled: false
+jev_model: jev-1.14
+jev_timeout_ms: 3000
+jev_confidence_threshold: 0.75
+```
+
+Only `JEV_API_KEY` is read (environment, then profile `get_secret`). Shadow is
+opt-in. After the flash path and its event persistence complete, a context-copied
+daemon worker sends one request to
+`https://mediocre-new-api.midway.run/typesafe/v1/systemone`, with no retries.
+The state is the original reply body; numbered lines from the exact slimmed
+flash rules become `r1`, `r2`, … Choice questions with `violation`/`ok` criteria.
+Only violation choices meeting the confidence threshold count as high confidence.
+The result never selects a reply, triggers rewriting, or changes fail-open.
+
+The worker enforces a wall deadline as well as the HTTP timeout. A running HTTP
+thread cannot be forcibly killed and may finish later; late results are ignored.
+JSONL appends a separate `hook: jev_shadow` event with the original `turn_id`,
+`session_id`, and `ts`, nullable `jev_*` fields, and successful per-rule
+`jev_results` (choice mapped to a boolean, confidence, probabilities).
+Disabled/skipped transforms keep these fields null. A failed flash judge has
+no boolean verdict, so disagreement remains null. Errors record only their type.
+`jev_wall_ms` excludes shadow persistence. No usage/cost estimate is inferred.
+
+PG migrates with `ADD COLUMN IF NOT EXISTS`; the worker uses its own connection
+and updates the latest row matching **turn_id and the original ts**, ordered by
+ts then id. This avoids overwriting a different session that reused a turn id.
+It updates only shadow fields and never inserts a duplicate transform event.
+If the original PG insert was skipped/failed, no row is synthesized; JSONL still
+retains the shadow result. Process exit can drop daemon work.
+
+```sql
+SELECT ts, session_id, turn_id, violation AS flash_violation,
+       jev_high_confidence_rules, jev_wall_ms
+FROM language_check_events
+WHERE jev_status = 'shadow_ok' AND jev_disagrees_with_flash IS TRUE
+ORDER BY ts DESC;
+```
+
+## Jev → GLM training and daily calibration
+
+`jev_training_enabled` defaults to `false`. When true, each enabled final-reply
+check starts a Jev task before GLM Flash and runs both concurrently, including
+replies below `min_chars`. Flash judge/rewrite remains the sole user-visible
+decision source. The reply never waits for Jev; its model latency critical path
+is Flash judging and optional rewriting (plus existing event persistence).
+Training takes precedence over `jev_shadow_enabled`, so no second shadow request
+is sent. With training off, existing opt-in shadow behavior is unchanged.
+
+The initial Flash event has `jev_training_status=pending`. Only after its PG
+INSERT/commit attempt and JSONL append finish does a background collector persist
+Jev results: it updates the same PG row identified by turn_id and original ts,
+and appends a `hook: jev_training` JSONL event with the same identity. A Jev result
+that finishes first still cannot update before the initial INSERT. Failed/skipped
+inserts do not synthesize rows. Process exit can drop background collection.
+
+Training records `jev_results` (per-rule choice, violation, confidence and both
+probabilities), `jev_conclusion`, `jev_overall_confidence`,
+`jev_overall_probability`, and `jev_training_status`. Final statuses are `trained`,
+`unconfigured`, `timeout`, or `error`; none changes Flash or rewriting. Invalid
+results are errors. No key or future is recorded. PostgreSQL adds nullable columns
+idempotently; shadow updates also persist their per-rule results.
+
+Aggregation never uses `jev_confidence_threshold`: any violation choice means
+`jev_conclusion=true`, taking the maximum confidence and maximum violation
+probability among violation choices. When every choice is ok, conclusion is false,
+taking the minimum confidence and minimum ok probability across all rules.
+
+Run the calibration manually (this does not install a cron job):
+
+```sh
+./venv/bin/python scripts/jev_calibrate.py --dry-run
+./venv/bin/python scripts/jev_calibrate.py --output /path/to/jev-calibration.json
+```
+
+The default output is `<hermes_home>/jev-calibration.json`. The script only reads
+PG, in a read-only transaction, using the existing `LANGUAGE_CHECK_PG_*`
+credential resolver. It selects only timestamps, event IDs, labels and scores;
+no reply text is read or printed. An old database without the migration reports
+`pg_unavailable`; the calibrator never migrates it. `--dry-run` writes nothing.
+Normal runs atomically replace the report and its adjacent `.state.json` sidecar.
+Stdout starts with a delivery-friendly summary followed by the complete JSON.
+
+Only trained events with non-null Flash truth, Jev conclusion and valid scores
+are eligible. Confidence and probability are scanned independently at thresholds
+0.00 through 0.99. Each threshold reports coverage, TP/FP/TN/FN, agreement, both
+predicted-class precisions and their two-sided 95% Wilson lower bounds.
+`--target-precision` defaults to 0.98; `--min-predicted-class-samples` defaults to
+50 **in each predicted class**. The lowest threshold satisfying both class counts
+and both lower bounds is the channel's recommendation. Only the safe channel
+with greater coverage is recommended overall (confidence wins a tie). Without
+both classes the status is `collecting`; adequate counts without a safe threshold
+produce `no_safe_threshold`. Perfect small samples are insufficient under Wilson.
+
+`recommended_escalation_threshold` is a **GLM review threshold**: in a future,
+manually approved selective-review mode, scores below it would require GLM;
+scores greater than or equal to it could adopt Jev's conclusion directly.
+During training **all replies still receive GLM review**, regardless of scores.
+This script does not change runtime behavior or plugin settings.
+
+Daily statistics use the last completed UTC day. The sidecar retains recent daily
+recommendations; repeated runs on one UTC day do not advance the streak. Gaps,
+changed score type/threshold, or fewer than `--min-daily-samples` (default 50)
+reset continuity. After `--stable-days` (default 7) consecutive completed daily
+observations with the same safe recommendation and sufficient new samples,
+`ready_to_stop_training=true` only reports data stability. Whether to stop training
+or adopt selective review must be decided manually; GLM is never removed by the
+calibrator. Keep the same output/sidecar and calibration parameters for comparable
+consecutive reports.

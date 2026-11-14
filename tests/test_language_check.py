@@ -613,3 +613,376 @@ def test_custom_miss_falls_back_builtin(plugin):
     base, key, source, mode = plugin[2]._provider_connection('zai')
     assert base == 'https://api.z.ai/api/paas/v4'
     assert (key, source, mode) == ('test-key', 'environ:ZAI_API_KEY', 'chat_completions')
+
+
+@pytest.fixture
+def shadow(plugin, monkeypatch):
+    module = plugin[2].jev_shadow
+    monkeypatch.delenv('JEV_API_KEY', raising=False)
+    monkeypatch.setattr(module, 'get_secret', Mock(return_value=None))
+    queued = []
+    real_schedule = module.schedule
+    monkeypatch.setattr(module, 'schedule', lambda *args: queued.append(args))
+    plugin[0].joinpath('config.yaml').write_text(
+        'plugins:\n  enabled: [language_check]\n  entries:\n    language_check:\n'
+        '      settings:\n        jev_shadow_enabled: true\n        jev_timeout_ms: 123\n')
+    # HTTP executor is deterministic; no real worker or network is needed.
+    from concurrent.futures import Future
+    executor = Mock()
+    executor.original_schedule = real_schedule
+
+    def submit(function, *args):
+        future = Future()
+        try:
+            future.set_result(function(*args))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    executor.submit.side_effect = submit
+    monkeypatch.setattr(module, 'ThreadPoolExecutor', Mock(return_value=executor))
+    return module, queued, executor
+
+
+def jev_response(confidence=0.9):
+    return httpx.Response(200, request=httpx.Request('POST', 'https://example.test'),
+                          json={'answers': {'r1': dict(choice='violation', confidence=confidence,
+                                probabilities={'violation': 0.95, 'ok': 0.05})}})
+
+
+def test_shadow_disabled_never_schedules(plugin, monkeypatch):
+    schedule = Mock()
+    monkeypatch.setattr(plugin[2].jev_shadow, 'schedule', schedule)
+    plugin[3].return_value = verdict()
+    assert invoke(plugin) is None
+    schedule.assert_not_called()
+    assert plugin[3].call_count == 1
+    assert event(plugin)['jev_status'] is None
+
+
+def test_shadow_one_request_many_rules(plugin, shadow, monkeypatch):
+    module, queued, executor = shadow
+    monkeypatch.setenv('JEV_API_KEY', 'test-only')
+    plugin[0].joinpath('language-discipline.md').write_text('1. 规则甲\n叙述\n3. 规则乙')
+    plugin[3].return_value = verdict()
+    assert invoke(plugin) is None
+    assert len(queued) == 1
+    _rules, text, _config, original, _path, _log = queued[0]
+    plugin[3].reset_mock()
+    payload = {'answers': {f'r{i}': dict(choice='ok', confidence=0.9,
+                probabilities={'violation': 0.05, 'ok': 0.95}) for i in (1, 2)}}
+    plugin[3].return_value = httpx.Response(200, json=payload,
+        request=httpx.Request('POST', 'https://example.test'))
+    module.run(*queued[0])
+    plugin[3].assert_called_once()
+    call = plugin[3].call_args
+    assert call.args == (module.ENDPOINT,)
+    assert call.kwargs['timeout'] == 0.123
+    body = call.kwargs['json']
+    assert body['state'] == original['reply_text'] == text
+    assert body['model'] == 'jev-1.14'
+    assert list(body['questions']) == ['r1', 'r2']
+    for key, rule in [('r1', '1. 规则甲'), ('r2', '3. 规则乙')]:
+        question = body['questions'][key]
+        assert question['type'] == 'choice'
+        assert set(question['criteria']) == {'violation', 'ok'}
+        assert rule in question['instructions'] and '代码块' in question['instructions']
+    module.get_secret.assert_not_called()
+    executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+    assert event(plugin)['jev_disagrees_with_flash'] is False
+
+
+@pytest.mark.parametrize('confidence,high', [(0.9, True), (0.75, True), (0.74, False)])
+def test_shadow_threshold_and_correlated_jsonl(plugin, shadow, confidence, high, monkeypatch):
+    module, queued, _ = shadow
+    module.get_secret.return_value = 'test-only'
+    store = Mock()
+    monkeypatch.setattr(module, 'EventStore', Mock(return_value=store))
+    plugin[3].return_value = verdict()
+    assert invoke(plugin) is None
+    original = event(plugin)
+    # Returning before the queued job runs proves shadow is outside the flash wait.
+    assert original['jev_status'] is None and len(queued) == 1
+    plugin[3].return_value = jev_response(confidence)
+    module.run(*queued[0])
+    record = event(plugin)
+    rule = '1. 不要使用夸张语气。'
+    assert record['hook'] == 'jev_shadow'
+    assert record['turn_id'] == original['turn_id'] and record['ts'] == original['ts']
+    assert record['jev_status'] == 'shadow_ok'
+    assert record['jev_high_confidence_rules'] == ([rule] if high else [])
+    assert record['jev_disagrees_with_flash'] is high
+    assert record['jev_results'][rule] == dict(violation=True, confidence=confidence,
+                                              probabilities={'violation': 0.95, 'ok': 0.05})
+    assert record['jev_wall_ms'] >= 0
+    store.write.assert_called_once_with(record, shadow=True)
+    module.get_secret.assert_called_once_with('JEV_API_KEY')
+
+
+@pytest.mark.parametrize('failure,status', [
+    (httpx.ReadTimeout('sensitive body'), 'timeout'),
+    (TimeoutError('sensitive body'), 'timeout'),
+    (RuntimeError('sensitive body'), 'error'),
+])
+def test_shadow_failures_preserve_flash_rewrite(plugin, shadow, failure, status):
+    module, queued, _ = shadow
+    module.get_secret.return_value = 'test-only'
+    plugin[3].side_effect = [verdict(True), response('权威改写')]
+    assert invoke(plugin) == '权威改写'
+    plugin[3].side_effect = failure
+    module.run(*queued[0])
+    record = event(plugin)
+    assert record['jev_status'] == status
+    assert record['jev_error'] == type(failure).__name__
+    assert 'sensitive' not in json.dumps(record)
+    assert record['jev_disagrees_with_flash'] is None
+
+
+def test_shadow_unconfigured_and_scheduler_failure(plugin, shadow, monkeypatch):
+    module, queued, _ = shadow
+    plugin[3].return_value = verdict()
+    assert invoke(plugin) is None
+    module.run(*queued[0])
+    assert event(plugin)['jev_status'] == 'unconfigured'
+    assert plugin[3].call_count == 1
+    thread = Mock()
+    thread.return_value.start.side_effect = RuntimeError('private')
+    monkeypatch.setattr(module, 'Thread', thread)
+    shadow[2].original_schedule(*queued[0])
+    assert thread.call_args.kwargs['daemon'] is True
+    thread.return_value.start.assert_called_once()
+
+
+def test_shadow_pg_migration_and_update(plugin, monkeypatch):
+    import psycopg2
+    from unittest.mock import MagicMock
+    pg = sys.modules[plugin[2].EventStore.__module__]
+    monkeypatch.setenv('LANGUAGE_CHECK_PG_HOST', '127.0.0.1')
+    connection = MagicMock(closed=False)
+    monkeypatch.setattr(psycopg2, 'connect', Mock(return_value=connection))
+    store = pg.EventStore()
+    original = dict(ts='2026-11-13T00:00:00+00:00', turn_id='same-turn', violation=False)
+    store.write(original)
+    shadow_event = dict(original, jev_status='shadow_ok', jev_wall_ms=12,
+                        jev_high_confidence_rules=['1. 规则'],
+                        jev_disagrees_with_flash=True, jev_error=None)
+    assert store.write(shadow_event, shadow=True) is None
+    calls = connection.cursor.return_value.__enter__.return_value.execute.call_args_list
+    for column in pg.SHADOW_COLUMNS:
+        assert f'ADD COLUMN IF NOT EXISTS {column} ' in calls[0].args[0]
+    insert, update = calls[1].args, calls[2].args
+    assert insert[0].startswith('INSERT')
+    assert update[0].startswith('UPDATE language_check_events SET')
+    assert 'WHERE turn_id = %s AND ts = %s ORDER BY ts DESC, id DESC LIMIT 1' in update[0]
+    assert update[1][-2:] == (original['turn_id'], original['ts'])
+    assert json.loads(update[1][2]) == ['1. 规则']
+    assert connection.commit.call_count == 3
+    store._close()
+
+
+def test_shadow_wall_deadline_discards_late_result(plugin, shadow):
+    module, queued, executor = shadow
+    module.get_secret.return_value = 'test-only'
+    plugin[3].return_value = verdict()
+    assert invoke(plugin) is None
+    future = Mock()
+    future.result.side_effect = TimeoutError('late body')
+    executor.submit.side_effect = None
+    executor.submit.return_value = future
+    module.run(*queued[0])
+    budget = future.result.call_args.kwargs['timeout']
+    assert 0 <= budget <= 0.123
+    assert event(plugin)['jev_status'] == 'timeout'
+    assert event(plugin)['jev_error'] == 'TimeoutError'
+    executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+
+
+@pytest.mark.parametrize('failure', [None, TimeoutError('private'), ValueError('private')])
+def test_training_precedes_flash_without_shadow(plugin, monkeypatch, failure, training_done):
+    module = plugin[2].jev_shadow
+    plugin[0].joinpath('config.yaml').write_text(
+        'plugins:\n  enabled: [language_check]\n  entries:\n    language_check:\n'
+        '      settings:\n        jev_training_enabled: true\n        jev_shadow_enabled: true\n'
+        '        min_chars: 9999\n')
+    from threading import Event
+    jev_started = Event()
+    order = []
+    def classify(*args):
+        order.append('jev')
+        jev_started.set()
+        if failure:
+            raise failure
+        return {'1. rule': dict(violation=True, confidence=.9,
+                               probabilities={'violation': .95, 'ok': .05})}
+    monkeypatch.setattr(module, 'classify', classify)
+    schedule = Mock()
+    monkeypatch.setattr(module, 'schedule', schedule)
+    def flash(*args, **kwargs):
+        assert jev_started.wait(5)
+        order.append('flash')
+        return verdict(False)
+    plugin[3].side_effect = flash
+    assert invoke(plugin) is None
+    assert training_done.wait(5)
+    assert order == ['jev', 'flash']
+    schedule.assert_not_called()
+    record = event(plugin)
+    assert record['violation'] is False
+    assert record['jev_training_status'] == ('trained' if failure is None else
+                                             'timeout' if isinstance(failure, TimeoutError) else 'error')
+    for name in ('jev_results', 'jev_conclusion', 'jev_overall_confidence',
+                 'jev_overall_probability', 'jev_training_status'):
+        assert name in record
+    assert 'private' not in json.dumps(record)
+
+
+@pytest.mark.parametrize('choices,confidence,probability,conclusion', [
+    (['violation', 'ok', 'violation'], .9, .8, True),
+    (['ok', 'ok', 'ok'], .2, .3, False),
+])
+def test_training_aggregate(plugin, choices, confidence, probability, conclusion):
+    answers = {str(i): dict(choice=c, confidence=score,
+        probabilities={c: p, 'ok' if c == 'violation' else 'violation': 1-p})
+        for i, (c, score, p) in enumerate(zip(choices, [.2, .99, .9], [.3, .99, .8]))}
+    result = plugin[2].jev_shadow.aggregate(answers)
+    assert result['jev_conclusion'] is conclusion
+    assert result['jev_overall_confidence'] == confidence
+    assert result['jev_overall_probability'] == probability
+    assert [a['choice'] for a in result['jev_results'].values()] == choices
+
+
+@pytest.mark.parametrize('answers', [{}, {'x': dict(choice='bad', confidence=.9,
+    probabilities={'ok': .9, 'violation': .1})}])
+def test_training_invalid_aggregation(plugin, answers):
+    with pytest.raises(ValueError):
+        plugin[2].jev_shadow.aggregate(answers)
+
+
+def test_training_pg_columns_and_json(plugin, monkeypatch):
+    import psycopg2
+    from unittest.mock import MagicMock
+    pg = sys.modules[plugin[2].EventStore.__module__]
+    monkeypatch.setenv('LANGUAGE_CHECK_PG_HOST', '127.0.0.1')
+    connection = MagicMock(closed=False)
+    monkeypatch.setattr(psycopg2, 'connect', Mock(return_value=connection))
+    store = pg.EventStore()
+    record = dict(ts='2026-11-13T00:00:00+00:00', jev_results={'rule': {'choice': 'ok'}},
+                  jev_conclusion=False, jev_overall_confidence=.8,
+                  jev_overall_probability=.9, jev_training_status='trained')
+    store.write(record)
+    calls = connection.cursor.return_value.__enter__.return_value.execute.call_args_list
+    for column in pg.TRAINING_COLUMNS:
+        assert f'ADD COLUMN IF NOT EXISTS {column} ' in calls[0].args[0]
+        value = calls[1].args[1][pg.COLUMNS.index(column)]
+        assert (json.loads(value) if column == 'jev_results' else value) == record[column]
+    store._close()
+
+
+@pytest.mark.parametrize('flash_failure', [False, True])
+def test_training_flash_alone_controls_rewrite_and_fail_open(plugin, monkeypatch, flash_failure, training_done):
+    plugin[0].joinpath('config.yaml').write_text(
+        'plugins:\n  enabled: [language_check]\n  entries:\n    language_check:\n'
+        '      settings:\n        jev_training_enabled: true\n')
+    monkeypatch.setattr(plugin[2].jev_shadow, 'classify', Mock(return_value={
+        '1. rule': dict(violation=False, confidence=.99,
+                       probabilities={'ok': .99, 'violation': .01})}))
+    plugin[3].side_effect = (TimeoutError('flash timeout') if flash_failure else
+                             [verdict(True), response('Flash改写')])
+    assert invoke(plugin) == (None if flash_failure else 'Flash改写')
+    assert training_done.wait(5)
+    record = event(plugin)
+    assert record['jev_training_status'] == 'trained'
+    assert record['jev_conclusion'] is False
+    assert record['violation'] is (None if flash_failure else True)
+
+
+@pytest.fixture
+def training_done(plugin, monkeypatch):
+    from threading import Event
+    done = Event()
+    original = plugin[2]._log
+
+    def log(path, record):
+        original(path, record)
+        if record.get('hook') == 'jev_training':
+            done.set()
+    monkeypatch.setattr(plugin[2], '_log', log)
+    return done
+
+
+@pytest.mark.parametrize('finish_during_insert', [False, True])
+@pytest.mark.parametrize('failure', [None, TimeoutError('private'), ValueError('private')])
+def test_training_blocked_future_and_insert_order(
+        plugin, monkeypatch, training_done, failure, finish_during_insert):
+    from concurrent.futures import Future, ThreadPoolExecutor
+    from threading import Event
+    module = plugin[2].jev_shadow
+    plugin[0].joinpath('config.yaml').write_text(
+        'plugins:\n  enabled: [language_check]\n  entries:\n    language_check:\n'
+        '      settings:\n        jev_training_enabled: true\n        jev_shadow_enabled: true\n')
+    pending = Future()
+    started = Event()
+    order = []
+
+    def classify(*args):
+        order.append('jev')
+        started.set()
+        return pending.result(timeout=10)
+
+    def flash(*args, **kwargs):
+        assert started.wait(5)
+        order.append('flash')
+        return verdict(True) if order.count('flash') == 1 else response('Flash改写')
+
+    def finish():
+        if failure:
+            pending.set_exception(failure)
+        else:
+            pending.set_result({'1. rule': dict(violation=False, confidence=.99,
+                                probabilities={'ok': .99, 'violation': .01})})
+
+    def insert(record, **kwargs):
+        if finish_during_insert:
+            finish()
+            assert not training_done.is_set()
+        assert record['jev_training_status'] == 'pending'
+        assert 'hook' not in record
+        json.dumps(record)
+        order.append('insert')
+
+    store = Mock()
+    def update(record, **kwargs):
+        assert order.index('insert') < len(order)
+        order.append('update')
+    store.write.side_effect = update
+    monkeypatch.setattr(module, 'classify', classify)
+    monkeypatch.setattr(module, 'EventStore', Mock(return_value=store))
+    monkeypatch.setattr(plugin[2]._store, 'write', insert)
+    shadow = Mock()
+    monkeypatch.setattr(module, 'schedule', shadow)
+    plugin[3].side_effect = flash
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        transformed = executor.submit(invoke, plugin)
+        try:
+            assert transformed.result(timeout=5) == 'Flash改写'
+            initial = json.loads(plugin[0].joinpath(
+                'logs/language-check.jsonl').read_text().splitlines()[0])
+            assert initial['jev_training_status'] == 'pending'
+            assert pending.done() is finish_during_insert
+            assert order[:4] == ['jev', 'flash', 'flash', 'insert']
+            if not finish_during_insert:
+                assert len(order) == 4
+        finally:
+            if not pending.done():
+                finish()
+    assert training_done.wait(5)
+    final = event(plugin)
+    assert final['hook'] == 'jev_training'
+    assert final['turn_id'] == initial['turn_id']
+    assert final['ts'] == initial['ts']
+    assert final['rewritten_text'] == 'Flash改写'
+    assert final['violation'] is True
+    assert final['jev_training_status'] == ('trained' if failure is None else
+        'timeout' if isinstance(failure, TimeoutError) else 'error')
+    assert order[-1] == 'update'
+    shadow.assert_not_called()

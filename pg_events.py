@@ -1,4 +1,5 @@
 """Optional single-connection PostgreSQL event sink; JSONL remains independent."""
+import json
 import logging
 import os
 from threading import Lock
@@ -7,12 +8,16 @@ from time import monotonic
 from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
+TRAINING_COLUMNS = ("jev_results", "jev_conclusion", "jev_overall_confidence",
+                    "jev_overall_probability", "jev_training_status")
+SHADOW_COLUMNS = ("jev_status", "jev_wall_ms", "jev_high_confidence_rules",
+                  "jev_disagrees_with_flash", "jev_error")
 COLUMNS = (
     'ts', 'session_id', 'platform', 'turn_id', 'violation', 'violated_rules',
     'analysis', 'severity', 'rewritten', 'recheck_skipped', 'reply_chars',
     'judge_ms', 'rewrite_ms', 'wall_ms', 'error', 'skipped', 'reply_text',
     'rewritten_text', 'model', 'py', 'pg_error', 'key_source', 'rules_chars',
-)
+) + SHADOW_COLUMNS + TRAINING_COLUMNS
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS language_check_events (
  id bigserial PRIMARY KEY, ts timestamptz NOT NULL,
@@ -26,6 +31,16 @@ ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS py text;
 ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS pg_error text;
 ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS key_source text;
 ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS rules_chars int;
+ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS jev_status text;
+ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS jev_wall_ms real;
+ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS jev_high_confidence_rules jsonb;
+ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS jev_disagrees_with_flash boolean;
+ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS jev_error text;
+ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS jev_results jsonb;
+ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS jev_conclusion boolean;
+ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS jev_overall_confidence real;
+ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS jev_overall_probability real;
+ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS jev_training_status text;
 CREATE INDEX IF NOT EXISTS idx_lc_ts ON language_check_events (ts);
 CREATE INDEX IF NOT EXISTS idx_lc_violation ON language_check_events (violation) WHERE violation;
 """
@@ -56,7 +71,7 @@ class EventStore:
             except Exception:
                 logger.warning('Language check PG close failed')
 
-    def write(self, event=None, *, started=None):
+    def write(self, event=None, *, started=None, shadow=False):
         # Do not queue replies behind another hook's database operation.
         if not self._lock.acquire(blocking=False):
             return
@@ -86,11 +101,21 @@ class EventStore:
                 if started is not None:
                     event["wall_ms"] = (monotonic() - started) * 1000
                 with self._connection.cursor() as cursor:
-                    cursor.execute(
-                        'INSERT INTO language_check_events (' + ', '.join(COLUMNS) +
-                        ') VALUES (' + ', '.join(['%s'] * len(COLUMNS)) + ')',
-                        tuple(event.get(column) for column in COLUMNS),
-                    )
+                    if shadow:
+                        cursor.execute(
+                            'UPDATE language_check_events SET ' +
+                            ', '.join(column + ' = %s' for column in SHADOW_COLUMNS + TRAINING_COLUMNS) +
+                            ' WHERE id = (SELECT id FROM language_check_events '
+                            'WHERE turn_id = %s AND ts = %s ORDER BY ts DESC, id DESC LIMIT 1)',
+                            tuple(_event_value(event, column) for column in SHADOW_COLUMNS + TRAINING_COLUMNS) +
+                            (event['turn_id'], event['ts']),
+                        )
+                    else:
+                        cursor.execute(
+                            'INSERT INTO language_check_events (' + ', '.join(COLUMNS) +
+                            ') VALUES (' + ', '.join(['%s'] * len(COLUMNS)) + ')',
+                            tuple(_event_value(event, column) for column in COLUMNS),
+                        )
                 self._connection.commit()
         except Exception as exc:
             # Never log the exception/DSN: driver messages can contain credentials.
@@ -99,3 +124,10 @@ class EventStore:
             return f"{type(exc).__name__}: {exc}"
         finally:
             self._lock.release()
+
+
+def _event_value(event, column):
+    value = event.get(column)
+    if column in ('jev_high_confidence_rules', 'jev_results') and value is not None:
+        return json.dumps(value, ensure_ascii=False)
+    return value
