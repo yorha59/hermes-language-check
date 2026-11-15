@@ -17,7 +17,10 @@ try:
     from plugins.language_check.pg_events import _parameter
 except ImportError:
     from pg_events import _parameter
-from scripts.language_rules_distill import jsonl_events
+try:
+    from scripts.language_rules_distill import jsonl_events
+except ImportError:
+    from language_rules_distill import jsonl_events
 
 SQL = """SELECT id, ts, jev_conclusion, violation,
 jev_overall_confidence, jev_overall_probability
