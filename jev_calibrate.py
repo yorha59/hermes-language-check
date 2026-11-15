@@ -17,6 +17,7 @@ try:
     from plugins.language_check.pg_events import _parameter
 except ImportError:
     from pg_events import _parameter
+from scripts.language_rules_distill import jsonl_events
 
 SQL = """SELECT id, ts, jev_conclusion, violation,
 jev_overall_confidence, jev_overall_probability
@@ -26,13 +27,39 @@ AND jev_conclusion IS NOT NULL AND jev_overall_confidence IS NOT NULL
 AND jev_overall_probability IS NOT NULL ORDER BY id"""
 
 
-def read_events():
-    import psycopg2
+def read_jsonl_events(path=None):
+    rows = []
+    for line_id, event in jsonl_events(path):
+        if event.get('hook') != 'jev_training' or event.get('jev_training_status') != 'trained':
+            continue
+        fields = ('ts', 'jev_conclusion', 'violation',
+                  'jev_overall_confidence', 'jev_overall_probability')
+        if any(event.get(key) is None for key in fields):
+            continue
+        if not all(isinstance(event[key], bool) for key in ('jev_conclusion', 'violation')):
+            continue
+        scores = [event[key] for key in fields[-2:]]
+        if not all(type(score) in (int, float) and 0 <= score <= 1 for score in scores):
+            continue
+        try:
+            stamp = datetime.fromisoformat(event['ts'])
+        except (TypeError, ValueError):
+            continue
+        if stamp.tzinfo is None:
+            continue
+        rows.append(dict(id=line_id, ts=stamp, conclusion=event['jev_conclusion'],
+                         violation=event['violation'], confidence=scores[0],
+                         overall_probability=scores[1]))
+    return rows
+
+
+def read_events(log_path=None):
     params = {key: _parameter(suffix) for key, suffix in
               [('host', 'HOST'), ('port', 'PORT'), ('dbname', 'DB'),
                ('user', 'USER'), ('password', 'PASSWORD')]}
     if not params['host']:
-        raise ValueError('PG host is not configured')
+        return read_jsonl_events(log_path)
+    import psycopg2
     connection = psycopg2.connect(**{k: v for k, v in params.items() if v is not None},
                                   connect_timeout=5)
     try:
@@ -204,6 +231,7 @@ def summary_text(report, rows):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--log-path', type=Path, help='JSONL input (or LANGUAGE_CHECK_LOG_PATH)')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--json', action='store_true', help='also print full JSON')
@@ -219,7 +247,7 @@ def main(argv=None):
     sidecar = output.with_name(output.name + '.state.json')
     state = json.loads(sidecar.read_text()) if sidecar.exists() else {}
     try:
-        rows = read_events()
+        rows = read_events(args.log_path) if args.log_path else read_events()
     except Exception as exc:
         # Never expose connection strings, credentials, or driver response text.
         print('status=pg_unavailable error=' + type(exc).__name__)

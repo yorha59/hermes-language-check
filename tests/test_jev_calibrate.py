@@ -163,3 +163,44 @@ def test_daily_metrics_use_completed_day_only():
     assert report['daily']['new_samples'] == 100
     assert report['daily']['agreement'] == 0
     assert report['agreement'] > .8
+
+
+@pytest.mark.parametrize('host', [None, ''])
+def test_jsonl_calibration_without_pg_import(tmp_path, monkeypatch, capsys, host):
+    import builtins
+    import runpy
+
+    monkeypatch.setattr(jc, '_parameter', lambda suffix: host if suffix == 'HOST' else None)
+    monkeypatch.setattr(jc, 'get_hermes_home', lambda: tmp_path)
+    from scripts import language_rules_distill
+    monkeypatch.setattr(language_rules_distill, 'get_hermes_home', lambda: tmp_path)
+    monkeypatch.delenv('LANGUAGE_CHECK_LOG_PATH', raising=False)
+    original_import = builtins.__import__
+
+    def no_pg(name, *args, **kwargs):
+        if name == 'psycopg2' or name.startswith('psycopg2.'):
+            pytest.fail('JSONL mode imported psycopg2')
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', no_pg)
+    runpy.run_path(jc.__file__, run_name='calibrate_import_probe')
+    assert jc.main(['--dry-run']) == 0
+    assert '样本: 0' in capsys.readouterr().out
+    log = tmp_path / 'logs' / 'language-check.jsonl'
+    log.parent.mkdir()
+    event = dict(hook='jev_training', jev_training_status='trained', ts=NOW.isoformat(),
+                 violation=True, jev_conclusion=True, jev_overall_confidence=.9,
+                 jev_overall_probability=.8)
+    invalid = [dict(event, hook='jev_shadow'), dict(event, jev_training_status='pending'),
+               dict(event, violation=None), dict(event, jev_conclusion=None),
+               dict(event, jev_overall_probability=None), dict(event, ts='bad'),
+               dict(event, jev_overall_confidence=2), dict(event, jev_overall_probability='bad')]
+    log.write_text('broken\n[]\n' + '\n'.join(json.dumps(e) for e in invalid + [event]) + '\n')
+    assert jc.main(['--dry-run']) == 0
+    out = capsys.readouterr().out
+    assert '样本: 1' in out and 'collecting' in out
+    assert '"schema_version"' not in out
+    monkeypatch.setenv('LANGUAGE_CHECK_LOG_PATH', str(log))
+    assert len(jc.read_events()) == 1
+    assert jc.main(['--dry-run', '--log-path', str(log), '--json']) == 0
+    assert '"sample_count": 1' in capsys.readouterr().out

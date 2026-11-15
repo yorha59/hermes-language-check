@@ -2,6 +2,7 @@
 import json
 from unittest.mock import MagicMock
 
+import psycopg2
 import httpx
 import pytest
 
@@ -17,10 +18,11 @@ def setup_run(tmp_path, monkeypatch):
     paths['archive'].write_text('original archive\n')
     monkeypatch.setenv('ZAI_API_KEY', 'test-key')
     rows = [(i, ['禁用套话'], '分析', 'medium', '回复' * 150, '') for i in range(1, 4)]
+    monkeypatch.setenv('LANGUAGE_CHECK_PG_HOST', 'localhost')
     connection = MagicMock()
     cursor = connection.cursor.return_value.__enter__.return_value
     cursor.fetchall.side_effect = lambda: [r for r in rows if r[0] > cursor.execute.call_args.args[1][0]]
-    monkeypatch.setattr(distill.psycopg2, 'connect', MagicMock(return_value=connection))
+    monkeypatch.setattr(psycopg2, 'connect', MagicMock(return_value=connection))
     response = MagicMock()
     response.json.return_value = {'choices': [{'message': {'content': json.dumps({
         'rule_line': '- 禁用套话：“回复”→改：直接表达结论', 'confidence': 'high'}, ensure_ascii=False)}}]}
@@ -93,7 +95,7 @@ def test_failures_preserve_cursor(setup_run, monkeypatch, capsys, failure):
     paths, _, _, post = setup_run
     original = paths['soul'].read_bytes()
     if failure == 'pg':
-        distill.psycopg2.connect.side_effect = distill.psycopg2.OperationalError('unavailable')
+        psycopg2.connect.side_effect = psycopg2.OperationalError('unavailable')
     elif failure == 'llm':
         post.side_effect = httpx.ReadTimeout('timeout')
     else:
@@ -155,7 +157,7 @@ def test_summary_size(setup_run, capsys):
 
 
 def test_exact_length_and_batch_capacity(setup_run, capsys):
-    paths, rows, response, _ = setup_run
+    _paths, rows, response, _ = setup_run
     line = '- 禁用套话：“' + '回复' * 19 + '”→改：直接表达结论'
     line = line.replace('回复' * 19, '回复' * 19 + '回' * (60 - len(line)))
     assert len(line) == 60
@@ -199,3 +201,50 @@ def test_default_does_not_require_soul(setup_run):
     assert distill.main([]) == 0
     assert paths['dynamic'].exists()
     assert not paths['soul'].exists()
+
+
+@pytest.mark.parametrize('host', [None, ''])
+def test_jsonl_without_pg_import(setup_run, tmp_path, monkeypatch, host):
+    import builtins
+    import runpy
+
+    paths, _, _, post = setup_run
+    if host is None:
+        monkeypatch.delenv('LANGUAGE_CHECK_PG_HOST')
+    else:
+        monkeypatch.setenv('LANGUAGE_CHECK_PG_HOST', host)
+    log = tmp_path / 'logs' / 'language-check.jsonl'
+    log.parent.mkdir()
+    monkeypatch.setattr(distill, 'get_hermes_home', lambda: tmp_path)
+    monkeypatch.delenv('LANGUAGE_CHECK_LOG_PATH', raising=False)
+    event = dict(violation=True, violated_rules=['禁用套话'], analysis='分析',
+                 severity='medium', reply_text='回复', rewritten_text='改写')
+    # Mixed IDs must not make an appended event disappear behind a large explicit ID.
+    log.write_text('not JSON\n' + json.dumps(dict(event, id=900)) + '\n' +
+                   json.dumps(event) + '\n' + json.dumps(event) + '\n')
+    original_import = builtins.__import__
+
+    def no_pg(name, *args, **kwargs):
+        if name == 'psycopg2' or name.startswith('psycopg2.'):
+            pytest.fail('JSONL mode imported psycopg2')
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', no_pg)
+    runpy.run_path(distill.__file__, run_name='distill_import_probe')
+    assert distill.read_events(3) == [(4, ['禁用套话'], '分析', 'medium', '回复', '改写')]
+    assert distill.main([]) == 0
+    assert json.loads(paths['state'].read_text()) == {'last_event_id': 4}
+    assert paths['dynamic'].exists()
+    assert distill.main([]) == 0
+    post.assert_called_once()
+    with log.open('a') as stream:
+        stream.write(json.dumps(event) + '\n')
+        stream.write(json.dumps(dict(event, hook='jev_training')) + '\n')
+        stream.write(json.dumps(dict(event, hook='jev_shadow')) + '\n')
+    assert distill.read_events(4)[0][0] == 5
+    assert distill.main(['--log-path', str(log)]) == 0
+    post.assert_called_once()
+    assert json.loads(paths['state'].read_text()) == {'last_event_id': 5}
+    monkeypatch.setenv('LANGUAGE_CHECK_LOG_PATH', str(log))
+    assert len(distill.read_events(0)) == 4
+    assert distill.read_events(0, tmp_path / 'missing') == []

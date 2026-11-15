@@ -1,5 +1,9 @@
 # Language check
 
+**Core path = JSONL only. PostgreSQL is optional analytics.**
+The plugin, distill and calibrate all work without any `LANGUAGE_CHECK_PG_*`
+variables or a PostgreSQL driver/server.
+
 Enable this bundled plugin by adding `language_check` to the existing
 `plugins.enabled` list in the active profile's config.yaml. Preserve other entries.
 The checker defaults to enabled once the plugin is loaded.
@@ -120,6 +124,10 @@ the reply. Each judge/rewrite has a plugin wall-clock deadline covering queueing
 result at the deadline and shuts down the executor with `wait=False`. The HTTP
 request can finish in the background; Python cannot forcibly stop a running worker thread.
 
+## Persistence
+
+**Core path = JSONL only. PostgreSQL is optional analytics.**
+
 Every invocation appends a JSONL record, including skipped and failed checks.
 The default is `<hermes_home>/logs/language-check.jsonl`. Records contain the
 original reply and, when rewritten, the replacement, plus both stages' elapsed
@@ -137,7 +145,7 @@ cost but excluding its own INSERT/commit. `judge_ms` and
 Optional PostgreSQL persistence reads `LANGUAGE_CHECK_PG_HOST`,
 `LANGUAGE_CHECK_PG_PORT`, `LANGUAGE_CHECK_PG_DB`, `LANGUAGE_CHECK_PG_USER` and
 `LANGUAGE_CHECK_PG_PASSWORD` from the profile environment. No credentials are
-stored in settings. Install psycopg2 in the runtime environment if needed.
+stored in settings. Install psycopg2 in the runtime environment if you opt into PG.
 When HOST is absent only JSONL is used. Plugin registration creates the table and
 indexes when configured; a lost connection is re-established on the next event.
 The sink keeps at most one connection, closing it if profile credentials change.
@@ -153,7 +161,7 @@ synchronous: database connection failure can add up to the connection timeout to
 reply latency, reflected in JSONL `wall_ms`. No connection pool or
 background database worker is used.
 
-Run these queries in `hermes_eval`:
+If you opt into PostgreSQL, run these optional analytics queries in your database:
 
 ```sql
 -- Rates among evaluated replies (skip/errors with no verdict excluded).
@@ -187,7 +195,15 @@ message content is unchanged. No block directives are returned. Each invocation
 logs `hook`, `ts`, `file_chars`, `truncated`, `window_tokens`, `budget_chars`, and `injected_chars` (file characters, excluding the prefix) to
 the configured JSONL without PostgreSQL persistence. Failures add no context.
 
-Run `scripts/language_rules_distill.py` explicitly to distill rules. The default
+Run `scripts/language_rules_distill.py` explicitly to distill rules. Without
+`LANGUAGE_CHECK_PG_HOST`, input defaults to `<hermes_home>/logs/language-check.jsonl`.
+Both scripts accept `--log-path` or `LANGUAGE_CHECK_LOG_PATH` to override that input
+(e.g. to match the plugin's `log_path` setting). A configured HOST selects PG;
+connections use keyword parameters. JSONL IDs are physical line numbers, including
+skipped lines, so keep the input append-only. The distiller scans cumulatively to
+retain below-threshold counts, skips already saved rule names before LLM calls,
+and records the highest eligible line ID as state `last_event_id`.
+The default
 target is `<hermes_home>/language-rules-dynamic.md`; `DISTILL_DYNAMIC_PATH`
 overrides it. Rules are deduplicated by name with at most 30 entries
 (`--max-entries` defaults to 30 and may lower that cap). Provenance continues to
@@ -266,9 +282,9 @@ is Flash judging and optional rewriting (plus existing event persistence).
 Training takes precedence over `jev_shadow_enabled`, so no second shadow request
 is sent. With training off, existing opt-in shadow behavior is unchanged.
 
-The initial Flash event has `jev_training_status=pending`. Only after its PG
-INSERT/commit attempt and JSONL append finish does a background collector persist
-Jev results: it updates the same PG row identified by turn_id and original ts,
+The initial Flash event has `jev_training_status=pending`. Only after its JSONL append and optional PG
+INSERT/commit attempt finish does a background collector persist
+Jev results: when PG is configured it updates the same PG row identified by turn_id and original ts,
 and appends a `hook: jev_training` JSONL event with the same identity. A Jev result
 that finishes first still cannot update before the initial INSERT. Failed/skipped
 inserts do not synthesize rows. Process exit can drop background collection.
@@ -292,13 +308,17 @@ Run the calibration manually (this does not install a cron job):
 ./venv/bin/python scripts/jev_calibrate.py --output /path/to/jev-calibration.json
 ```
 
-The default output is `<hermes_home>/jev-calibration.json`. The script only reads
-PG, in a read-only transaction, using the existing `LANGUAGE_CHECK_PG_*`
-credential resolver. It selects only timestamps, event IDs, labels and scores;
-no reply text is read or printed. An old database without the migration reports
-`pg_unavailable`; the calibrator never migrates it. `--dry-run` writes nothing.
-Normal runs atomically replace the report and its adjacent `.state.json` sidecar.
-Stdout starts with a delivery-friendly summary followed by the complete JSON.
+The default output is `<hermes_home>/jev-calibration.json`. Without HOST the script
+reads the same default JSONL as distill (with the same input overrides), selecting
+`hook=jev_training` records with `jev_training_status=trained` and complete labels,
+timestamps and scores. A missing JSONL file is an empty sample (`collecting`).
+When HOST is configured, it reads PG in a read-only transaction using the existing
+`LANGUAGE_CHECK_PG_*` credential resolver. The PG query selects only timestamps,
+event IDs, labels and scores; no reply text is printed in either mode. An old
+database without the migration reports `pg_unavailable`; the calibrator never
+migrates it. `--dry-run` writes nothing. Normal runs atomically replace the report
+and its adjacent `.state.json` sidecar. Stdout defaults to a short statistics
+summary; add `--json` to also print the complete JSON report.
 
 Only trained events with non-null Flash truth, Jev conclusion and valid scores
 are eligible. Confidence and probability are scanned independently at thresholds

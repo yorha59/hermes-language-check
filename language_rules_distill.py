@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Distill high-confidence language rules from PostgreSQL violation events.
+"""Distill high-confidence language rules from JSONL violation events or optional PostgreSQL analytics.
 
 Run explicitly; this script is independent of the language_check runtime.
 DISTILL_DYNAMIC_PATH, DISTILL_SOUL_PATH, DISTILL_ARCHIVE_PATH and
@@ -16,7 +16,6 @@ import sys
 import tempfile
 
 import httpx
-import psycopg2
 
 # Support direct execution from scripts/ without requiring an editable install.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -29,12 +28,38 @@ FROM language_check_events
 WHERE id > %s AND violation AND violated_rules <> '{}' ORDER BY id"""
 
 
-def read_events(last):
+def jsonl_events(path=None):
+    """Yield physical line IDs from an append-only log; absent logs are empty."""
+    path = Path(path or os.environ.get('LANGUAGE_CHECK_LOG_PATH') or
+                Path(get_hermes_home()) / 'logs/language-check.jsonl').expanduser()
+    try:
+        stream = path.open(encoding='utf-8')
+    except FileNotFoundError:
+        return
+    with stream:
+        for line_id, line in enumerate(stream, 1):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                yield line_id, event
+
+
+def read_events(last, log_path=None):
+    if not os.environ.get('LANGUAGE_CHECK_PG_HOST'):
+        return [(line_id, event['violated_rules'], event.get('analysis'),
+                 event.get('severity'), event.get('reply_text'), event.get('rewritten_text'))
+                for line_id, event in jsonl_events(log_path)
+                if line_id > last and event.get('violation') is True
+                and event.get('hook') not in ('jev_training', 'jev_shadow')
+                and isinstance(event.get('violated_rules'), list) and event['violated_rules']]
+    import psycopg2
+
     params = {key: os.environ['LANGUAGE_CHECK_PG_' + suffix]
               for key, suffix in [('host', 'HOST'), ('port', 'PORT'), ('dbname', 'DB'),
                                   ('user', 'USER'), ('password', 'PASSWORD')]
               if os.environ.get('LANGUAGE_CHECK_PG_' + suffix)}
-    params.setdefault('host', '127.0.0.1')
     params.setdefault('port', '5432')
     connection = psycopg2.connect(**params, connect_timeout=5)
     try:
@@ -175,7 +200,7 @@ def read_text(path):
     return path.read_bytes().decode('utf-8')
 
 
-def run(threshold, dry_run, max_entries=30, write_soul=False):
+def run(threshold, dry_run, max_entries=30, write_soul=False, log_path=None):
     home = Path(get_hermes_home())
     dynamic = Path(os.environ.get('DISTILL_DYNAMIC_PATH', str(home / 'language-rules-dynamic.md')))
     soul, archive, state = [Path(os.environ.get(env, str(home / default)))
@@ -185,7 +210,7 @@ def run(threshold, dry_run, max_entries=30, write_soul=False):
     # Cumulative counting: always scan all events; dynamic rules 'already present'
     # dedupe prevents re-insertion, so below-threshold events are never lost.
     last = 0
-    events = read_events(last)
+    events = read_events(last, log_path)
     groups = defaultdict(list)
     for row in events:
         for name in dict.fromkeys(n for n in row[1] if isinstance(n, str) and n.strip()):
@@ -195,6 +220,12 @@ def run(threshold, dry_run, max_entries=30, write_soul=False):
         if len(rows) < threshold:
             skipped[name] = 'below threshold'
             continue
+        # Keep cumulative below-threshold counts without paying to distill saved rules again.
+        if dynamic.exists() and not write_soul:
+            _, _, duplicates = insert_dynamic(read_text(dynamic), [(name, '', [])], max_entries)
+            if duplicates.get(name) == 'already present':
+                skipped[name] = 'already present'
+                continue
         line, reason = distill(name, rows)
         if reason:
             skipped[name] = reason
@@ -239,6 +270,7 @@ def run(threshold, dry_run, max_entries=30, write_soul=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--log-path', type=Path, help='JSONL input (or LANGUAGE_CHECK_LOG_PATH)')
     parser.add_argument('--threshold', type=int, default=3)
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--max-entries', type=int, default=30)
@@ -249,7 +281,7 @@ def main(argv=None):
     if args.max_entries < 1:
         parser.error('--max-entries must be positive')
     try:
-        run(args.threshold, args.dry_run, args.max_entries, args.write_soul)
+        run(args.threshold, args.dry_run, args.max_entries, args.write_soul, args.log_path)
     except Exception as exc:
         # Driver and HTTP exceptions may embed credentials; report only their type.
         detail = str(exc) if isinstance(exc, (ValueError, FileNotFoundError)) else type(exc).__name__
