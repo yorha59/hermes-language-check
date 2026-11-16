@@ -95,15 +95,34 @@ def test_missing_day_breaks_streak():
     assert report['stability']['stable_days'] == 1
 
 
+def test_judge_label_follows_config(tmp_path, monkeypatch):
+    home = tmp_path / 'home'
+    home.mkdir()
+    (home / 'config.yaml').write_text(
+        'plugins:\n  entries:\n    language_check:\n      settings:\n'
+        '        judge_model: zai/glm-5.3\n'
+    )
+    monkeypatch.setattr(jc, 'get_hermes_home', lambda: home)
+    assert jc.judge_model() == 'zai/glm-5.3'
+    assert jc.judge_label() == 'glm-5.3'
+    report, _ = jc.calibrate(rows(n=20), now=NOW)
+    text = jc.summary_text(report, rows(n=20))
+    assert text.startswith('Jev/glm-5.3 校准日报')
+    assert 'glm-5.3违规:' in text
+    assert 'Flash违规' not in text
+
+
 def test_dry_run_and_atomic_output(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(jc, 'read_events', lambda: rows())
     output = tmp_path/'nested'/'calibration.json'
     assert jc.main(['--dry-run', '--output', str(output)]) == 0
     assert not output.parent.exists()
     out = capsys.readouterr().out
-    assert out.startswith('Jev/GLM 校准日报')
+    assert out.startswith('Jev/') and '校准日报' in out.splitlines()[0]
+    assert 'Flash违规' not in out
     assert '样本: 400' in out
     assert '推荐复审阈值:' in out
+    assert '真值模型:' in out
     replace = jc.os.replace
     calls = []
     def record(src, dest):

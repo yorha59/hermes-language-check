@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
-"""Read-only Jev/Flash calibration. Never changes runtime settings."""
+"""Read-only Jev/judge calibration. Never changes runtime settings."""
 import argparse
 from datetime import UTC, datetime, timedelta
 import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 
-_root = Path(__file__).resolve().parent
-_repo = _root.parents[0] if (_root / 'pg_events.py').exists() else _root.parents[1]
-sys.path.insert(0, str(_repo))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hermes_constants import get_hermes_home
-try:
-    from plugins.language_check.pg_events import _parameter
-except ImportError:
-    from pg_events import _parameter
+from plugins.language_check.pg_events import _parameter
 try:
     from scripts.language_rules_distill import jsonl_events
 except ImportError:
@@ -166,7 +162,10 @@ def calibrate(rows, *, minimum=50, target=0.98, now=None, state=None,
     m = selected['recommended_metrics'] or dict(trusted_coverage=0.0, agreement=0.0,
                  violation_precision_lower_95=None, ok_precision_lower_95=None)
     now = now or datetime.now(UTC)
-    report = dict(schema_version=1, generated_at=now.isoformat(), reference='flash_violation',
+    model = judge_model()
+    label = judge_label(model)
+    report = dict(schema_version=1, generated_at=now.isoformat(), reference='judge_violation',
+                  judge_model=model or label, judge_label=label,
                   sample_count=len(rows), recommended_score_type=best,
                   recommended_escalation_threshold=selected['recommended_escalation_threshold'],
                   status=selected['status'] if candidates else (
@@ -197,9 +196,37 @@ def atomic_write(path, value):
             os.unlink(name)
 
 
-def summary_text(report, rows):
+def judge_model(home=None):
+    """Current language_check judge_model from config; empty string if unresolved."""
+    home = Path(home or get_hermes_home())
+    path = home / 'config.yaml'
+    if not path.is_file():
+        return ''
+    try:
+        text = path.read_text(encoding='utf-8')
+    except OSError:
+        return ''
+    match = re.search(
+        r'(?ms)^[ \t]*language_check:[ \t]*\r?\n'
+        r'(?:^[ \t]+(?!language_check:).*\r?\n)*?'
+        r'^[ \t]+judge_model:[ \t]*([^#\r\n]+)',
+        text,
+    )
+    if match:
+        return match.group(1).strip().strip('"\'')
+    return ''
+
+
+def judge_label(model=None):
+    """Short display name for reports, e.g. glm-5.3 / glm-5.3-flash."""
+    raw = (model if model is not None else judge_model()) or 'judge'
+    return raw.split('/', 1)[-1] or 'judge'
+
+
+def summary_text(report, rows, label=None):
     n = len(rows)
-    flash_v = sum(r['violation'] for r in rows)
+    label = label or report.get('judge_label') or judge_label()
+    judge_v = sum(r['violation'] for r in rows)
     jev_v = sum(r['conclusion'] for r in rows)
     tp = sum(r['conclusion'] and r['violation'] for r in rows)
     fp = sum(r['conclusion'] and not r['violation'] for r in rows)
@@ -207,9 +234,10 @@ def summary_text(report, rows):
     fn = sum(not r['conclusion'] and r['violation'] for r in rows)
     agree = (tp + tn) / n if n else 0.0
     lines = [
-        'Jev/GLM 校准日报',
+        f'Jev/{label} 校准日报',
         f"状态: {report['status']} | 样本: {n} | 稳定天数: {report['stability']['stable_days']}/{report['stability']['required_stable_days']}",
-        f"Flash违规: {flash_v} | Jev违规: {jev_v} | 一致率: {agree:.1%}",
+        f"真值模型: {report.get('judge_model') or label}",
+        f"{label}违规: {judge_v} | Jev违规: {jev_v} | 一致率: {agree:.1%}",
         f"混淆矩阵: TP={tp} FP={fp} TN={tn} FN={fn}",
         '',
         '置信度分层一致率:',
@@ -219,7 +247,10 @@ def summary_text(report, rows):
         if not sub:
             continue
         a = sum(r['conclusion'] == r['violation'] for r in sub) / len(sub)
-        lines.append(f"- conf≥{lo:.1f}: n={len(sub)} 一致={a:.1%} Jev违规={sum(r['conclusion'] for r in sub)} Flash违规={sum(r['violation'] for r in sub)}")
+        lines.append(
+            f"- conf≥{lo:.1f}: n={len(sub)} 一致={a:.1%} Jev违规={sum(r['conclusion'] for r in sub)} "
+            f"{label}违规={sum(r['violation'] for r in sub)}"
+        )
     thr = report['recommended_escalation_threshold']
     lines += [
         '',
@@ -228,7 +259,7 @@ def summary_text(report, rows):
         f"昨日新增: {report['daily']['new_samples']}",
     ]
     if thr is None:
-        lines.append('说明: 样本不足或未达安全阈值，继续全量 GLM 复审。')
+        lines.append(f'说明: 样本不足或未达安全阈值，继续全量 {label} 复审。')
     return '\n'.join(lines)
 
 
@@ -258,7 +289,7 @@ def main(argv=None):
     report, state = calibrate(rows, minimum=args.min_predicted_class_samples,
         target=args.target_precision, state=state, stable_days=args.stable_days,
         min_daily=args.min_daily_samples)
-    print(summary_text(report, rows))
+    print(summary_text(report, rows, label=report.get('judge_label')))
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     if not args.dry_run:
