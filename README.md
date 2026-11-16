@@ -140,7 +140,7 @@ the exception type such as `TimeoutError`. Log failures only warn.
 configuration and rules loading (excluding the final JSONL append). PostgreSQL
 stores a snapshot immediately before INSERT, including any connection/schema
 cost but excluding its own INSERT/commit. `judge_ms` and
-`rewrite_ms` measure their respective stages. `model` is the original reply model.
+`rewrite_ms` measure their respective stages. `model` is the original reply model; `judge_model` is the configured judge.
 
 Optional PostgreSQL persistence reads `LANGUAGE_CHECK_PG_HOST`,
 `LANGUAGE_CHECK_PG_PORT`, `LANGUAGE_CHECK_PG_DB`, `LANGUAGE_CHECK_PG_USER` and

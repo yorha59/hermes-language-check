@@ -253,6 +253,7 @@ def _on_transform(response_text="", session_id="", platform="", turn_id="", *, c
                      recheck_skipped=False, wall_ms=0, py=sys.executable, pg_error=None,
                      key_source="missing", rules_chars=0, **jev_shadow.empty_fields())
         config = {key: ctx.get_config(key, default) for key, default in _DEFAULTS.items()}
+        event["judge_model"] = config["judge_model"]
         path = Path(config["log_path"]).expanduser() if config["log_path"] else path
         if not config["enabled"]:
             event["skipped"] = "disabled"
@@ -353,7 +354,8 @@ def _on_post_compaction(*, ctx, session_id="", old_session_id="", kind=None, rea
         path = Path(configured).expanduser() if configured else home / "logs/language-check.jsonl"
         _log(path, dict(hook="post_compaction", ts=datetime.now(UTC).isoformat(),
                         file_chars=len(rules), rule_lines=rule_lines,
-                        warning="dynamic-rules-over-budget"))
+                        warning="dynamic-rules-over-budget",
+                        judge_model=ctx.get_config("judge_model", _DEFAULTS["judge_model"])))
     except (Exception, ConfigBackendUnavailable):
         logger.warning("Dynamic language rules compaction check failed open", exc_info=True)
 
@@ -362,7 +364,9 @@ def _on_pre_llm_call(*, ctx, **_):
     """Use the host's API-only user suffix contract; history is never mutated."""
     path, injected, file_chars, truncated = None, 0, 0, False
     window_tokens, limit = None, None
+    judge_model = None
     try:
+        judge_model = ctx.get_config("judge_model", _DEFAULTS["judge_model"])
         home = Path(get_hermes_home())
         path = home / "logs" / "language-check.jsonl"
         configured = ctx.get_config("log_path", "")
@@ -389,7 +393,8 @@ def _on_pre_llm_call(*, ctx, **_):
         if path is not None:
             _log(path, dict(hook="pre_llm_call", ts=datetime.now(UTC).isoformat(),
                             injected_chars=injected, file_chars=file_chars, truncated=truncated,
-                            window_tokens=window_tokens, budget_chars=limit))
+                            window_tokens=window_tokens, budget_chars=limit,
+                            judge_model=judge_model))
 
 
 def register(ctx):

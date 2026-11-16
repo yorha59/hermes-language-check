@@ -16,7 +16,7 @@ COLUMNS = (
     'ts', 'session_id', 'platform', 'turn_id', 'violation', 'violated_rules',
     'analysis', 'severity', 'rewritten', 'recheck_skipped', 'reply_chars',
     'judge_ms', 'rewrite_ms', 'wall_ms', 'error', 'skipped', 'reply_text',
-    'rewritten_text', 'model', 'py', 'pg_error', 'key_source', 'rules_chars',
+    'rewritten_text', 'model', 'judge_model', 'py', 'pg_error', 'key_source', 'rules_chars',
 ) + SHADOW_COLUMNS + TRAINING_COLUMNS
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS language_check_events (
@@ -25,8 +25,9 @@ CREATE TABLE IF NOT EXISTS language_check_events (
  violation boolean, violated_rules text[], analysis text, severity text,
  rewritten boolean, recheck_skipped boolean,
  reply_chars int, judge_ms real, rewrite_ms real, wall_ms real,
- error text, skipped text, reply_text text, rewritten_text text, model text
+ error text, skipped text, reply_text text, rewritten_text text, model text, judge_model text
 );
+ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS judge_model text;
 ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS py text;
 ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS pg_error text;
 ALTER TABLE language_check_events ADD COLUMN IF NOT EXISTS key_source text;

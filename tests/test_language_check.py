@@ -64,6 +64,27 @@ def test_pass_unchanged(plugin):
     assert plugin[3].call_args.kwargs["json"]["max_tokens"] == 512
 
 
+@pytest.mark.parametrize("outcome", ["pass", "failure", "skip"])
+def test_transform_records_configured_judge_model(plugin, monkeypatch, outcome):
+    judge_model = "zai/glm-5.3"
+    plugin[0].joinpath("config.yaml").write_text(
+        "plugins:\n  enabled: [language_check]\n  entries:\n    language_check:\n"
+        f"      settings:\n        judge_model: {judge_model}\n"
+        f"        enabled: {'false' if outcome == 'skip' else 'true'}\n")
+    store = Mock()
+    store.write.return_value = None
+    monkeypatch.setattr(plugin[2], "_store", store)
+    if outcome == "failure":
+        plugin[3].side_effect = TimeoutError("judge timeout")
+    else:
+        plugin[3].return_value = verdict()
+    assert invoke(plugin) is None
+    record = event(plugin)
+    assert record["judge_model"] == judge_model
+    assert record["model"] == "main"
+    assert store.write.call_args.args[0]["judge_model"] == judge_model
+
+
 def test_violation_rewrites_once(plugin):
     rewritten = "事实\n\n|表|\n|---|\n|内容|\n\n```py\nx = 1\n```\n[链接](https://example.com)"
     plugin[3].side_effect = [verdict(True), response(rewritten)]
@@ -450,7 +471,8 @@ def test_post_compaction_budget(plugin, caplog, rules, warning):
         record = event(plugin)
         assert record == dict(hook='post_compaction', ts=record['ts'],
                               file_chars=len(rules), rule_lines=rules.count('- '),
-                              warning='dynamic-rules-over-budget')
+                              warning='dynamic-rules-over-budget',
+                              judge_model=plugin[2]._DEFAULTS['judge_model'])
     else:
         assert not log.exists()
 
@@ -867,11 +889,14 @@ def test_training_pg_columns_and_json(plugin, monkeypatch):
     monkeypatch.setattr(psycopg2, 'connect', Mock(return_value=connection))
     store = pg.EventStore()
     record = dict(ts='2026-11-13T00:00:00+00:00', jev_results={'rule': {'choice': 'ok'}},
+                  judge_model='zai/glm-5.3',
                   jev_conclusion=False, jev_overall_confidence=.8,
                   jev_overall_probability=.9, jev_training_status='trained')
     store.write(record)
     calls = connection.cursor.return_value.__enter__.return_value.execute.call_args_list
-    for column in pg.TRAINING_COLUMNS:
+    assert 'judge_model' in pg.COLUMNS
+    assert 'judge_model text' in calls[0].args[0]
+    for column in ('judge_model',) + pg.TRAINING_COLUMNS:
         assert f'ADD COLUMN IF NOT EXISTS {column} ' in calls[0].args[0]
         value = calls[1].args[1][pg.COLUMNS.index(column)]
         assert (json.loads(value) if column == 'jev_results' else value) == record[column]
@@ -946,6 +971,7 @@ def test_training_blocked_future_and_insert_order(
             finish()
             assert not training_done.is_set()
         assert record['jev_training_status'] == 'pending'
+        assert record['judge_model'] == plugin[2]._DEFAULTS['judge_model']
         assert 'hook' not in record
         json.dumps(record)
         order.append('insert')
