@@ -139,7 +139,7 @@ def test_judge_model_large_missing_value_finishes(tmp_path):
         [sys.executable, '-c',
          'from scripts.jev_calibrate import judge_model; '
          'import sys; assert judge_model(sys.argv[1]) == ""', str(tmp_path)],
-        capture_output=True, text=True, timeout=2,
+        capture_output=True, text=True, timeout=2, check=False,
     )
     assert result.returncode == 0, result.stderr
 
