@@ -27,7 +27,7 @@ _store = EventStore()
 _DEFAULTS = dict(enabled=True, min_chars=20, judge_timeout_ms=12000, rewrite_timeout_s=8,
                  inject_budget_percent=5.0, inject_max_chars=0, context_window_tokens=128000,
                  jev_training_enabled=False, jev_shadow_enabled=False, jev_model="jev-1.14", jev_timeout_ms=3000,
-                 jev_confidence_threshold=0.75, judge_provider="", disable_thinking=True, log_path="", judge_model="zai/glm-5.3-flash", rewrite_model="")
+                 jev_exclude_rule_numbers=[], jev_confidence_threshold=0.75, judge_provider="", disable_thinking=True, log_path="", judge_model="zai/glm-5.3-flash", rewrite_model="")
 
 
 def _log(path, event):
@@ -202,17 +202,29 @@ def _judge_rules(rules, home):
     return numbered
 
 
+def _jev_rules(numbered_rules_text, exclude_numbers):
+    excluded = {number for number in exclude_numbers if type(number) is int}
+    return "\n".join(line for line in numbered_rules_text.splitlines()
+                     if (match := re.match(r"^(\d+)\.", line))
+                     and int(match[1]) not in excluded)
+
+
 def _check(text, config, event):
     rules = (Path(get_hermes_home()) / "language-discipline.md").read_text(encoding="utf-8")
     if not rules.strip():
         raise ValueError("Language discipline file is empty")
     judge_rules = _judge_rules(rules, Path(get_hermes_home()))
+    jev_rules = _jev_rules(judge_rules, config["jev_exclude_rule_numbers"])
     event["rules_chars"] = len(judge_rules)
     if config["jev_training_enabled"]:
-        event["jev_training_status"] = "pending"
-        event["_jev_training"] = jev_shadow.start_training(judge_rules, text, config)
+        event["jev_training_status"] = "pending" if jev_rules else "unconfigured"
+        if jev_rules:
+            event["_jev_training"] = jev_shadow.start_training(jev_rules, text, config)
     elif config["jev_shadow_enabled"]:
-        event["_jev_rules"] = judge_rules
+        if jev_rules:
+            event["_jev_rules"] = jev_rules
+        else:
+            event["jev_status"] = "unconfigured"
     if not judge_rules:
         raise ValueError("No numbered language discipline rules")
     started = monotonic()

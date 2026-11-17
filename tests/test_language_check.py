@@ -682,6 +682,49 @@ def test_shadow_disabled_never_schedules(plugin, monkeypatch):
     assert event(plugin)['jev_status'] is None
 
 
+def test_jev_rules_ignores_non_integer_exclusions(plugin):
+    rules = '8. eight\nnarrative\n1. one\n2. two\n### heading\n10. ten'
+    assert plugin[2]._jev_rules(rules, [8, '1', True, 2.0, None, {}]) == (
+        '1. one\n2. two\n10. ten')
+
+
+@pytest.mark.parametrize('mode', ['training', 'shadow'])
+@pytest.mark.parametrize('excluded', [[], [1, 8], list(range(1, 9))])
+def test_jev_exclusions_leave_glm_rules_intact(plugin, monkeypatch, mode, excluded):
+    rules = '\n'.join(f'{number}. rule {number}' for number in range(1, 9))
+    plugin[0].joinpath('language-discipline.md').write_text(rules)
+    plugin[0].joinpath('config.yaml').write_text(
+        'plugins:\n  enabled: [language_check]\n  entries:\n    language_check:\n'
+        f'      settings:\n        jev_{mode}_enabled: true\n'
+        f'        jev_exclude_rule_numbers: {excluded}\n')
+    module = plugin[2].jev_shadow
+    start = Mock(return_value=None)
+    schedule = Mock()
+    monkeypatch.setattr(module, 'start_training', start)
+    monkeypatch.setattr(module, 'schedule', schedule)
+    plugin[3].return_value = verdict()
+    assert invoke(plugin) is None
+    body = plugin[3].call_args.kwargs['json']
+    assert json.loads(body['messages'][-1]['content'])['rules'] == rules
+    record = event(plugin)
+    assert record['violation'] is False
+    assert record['error'] is None
+    expected = [line for number, line in enumerate(rules.splitlines(), 1)
+                if number not in excluded]
+    selected = start if mode == 'training' else schedule
+    if expected:
+        selected.assert_called_once()
+        sent_rules = selected.call_args.args[0]
+        request, lines = module.request_body(sent_rules, 'reply', 'jev-1.14')
+        assert lines == expected
+        assert len(request['questions']) == len(expected)
+    else:
+        start.assert_not_called()
+        schedule.assert_not_called()
+        status = 'jev_training_status' if mode == 'training' else 'jev_status'
+        assert record[status] == 'unconfigured'
+
+
 def test_shadow_one_request_many_rules(plugin, shadow, monkeypatch):
     module, queued, executor = shadow
     monkeypatch.setenv('JEV_API_KEY', 'test-only')

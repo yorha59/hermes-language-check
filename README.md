@@ -237,14 +237,22 @@ jev_shadow_enabled: false
 jev_model: jev-1.14
 jev_timeout_ms: 3000
 jev_confidence_threshold: 0.75
+jev_exclude_rule_numbers: []
 ```
+
+`jev_exclude_rule_numbers` excludes numbered rules from both Jev training and
+shadow only; GLM still receives all judge rules. The default empty list excludes
+nothing. For example, `[1, 8]` drops rules 1 and 8 from Jev. Non-integer entries
+(including strings and booleans) are ignored. Remaining numbered lines retain
+their order. If none remain, Jev is not started and its status is `unconfigured`;
+GLM judging still runs.
 
 Only `JEV_API_KEY` is read (environment, then profile `get_secret`). Shadow is
 opt-in. After the flash path and its event persistence complete, a context-copied
 daemon worker sends one request to
 `https://mediocre-new-api.midway.run/typesafe/v1/systemone`, with no retries.
 The state is the original reply body; numbered lines from the exact slimmed
-flash rules become `r1`, `r2`, … Choice questions with `violation`/`ok` criteria.
+flash rules, after exclusions, become `r1`, `r2`, … Choice questions with `violation`/`ok` criteria.
 Only violation choices meeting the confidence threshold count as high confidence.
 The result never selects a reply, triggers rewriting, or changes fail-open.
 
