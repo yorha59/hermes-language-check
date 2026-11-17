@@ -1,17 +1,13 @@
 """Calibration contracts using synthetic truth and daily observations."""
 from datetime import UTC, datetime, timedelta
 import json
+import subprocess
+import sys
 from unittest.mock import MagicMock
 
 import pytest
 
-try:
-    from scripts import jev_calibrate as jc
-except ImportError:
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    import jev_calibrate as jc
+from scripts import jev_calibrate as jc
 
 NOW = datetime(2026, 11, 13, tzinfo=UTC)
 
@@ -110,6 +106,42 @@ def test_judge_label_follows_config(tmp_path, monkeypatch):
     assert text.startswith('Jev/glm-5.3 校准日报')
     assert 'glm-5.3违规:' in text
     assert 'Flash违规' not in text
+
+
+@pytest.mark.parametrize('config,expected', [
+    ('language_check:\n  settings:\n    judge_model: provider/model\n', 'provider/model'),
+    ('judge_model: outside\nlanguage_check:\n  enabled: true\n'
+     'other:\n  judge_model: sibling\n', ''),
+    ('plugins:\n  language_check:\n    enabled: true\n'
+     '  other:\n    judge_model: sibling\n', ''),
+    ('other:\n  judge_model: outside\n', ''),
+    ('language_check:\n  # comment\n\n  judge_model: "provider/model" # note\n', 'provider/model'),
+    ("language_check: # settings\n  judge_model: 'provider/model' # note\n", 'provider/model'),
+    ('language_check:\n  judge_model: "provider/model#tag" # note\n', 'provider/model#tag'),
+    ('language_check:\n  judge_model: first # note\n  judge_model: second\n', 'first'),
+])
+def test_judge_model_block_scope_and_values(tmp_path, config, expected):
+    (tmp_path / 'config.yaml').write_text(config)
+    assert jc.judge_model(tmp_path) == expected
+
+
+def test_judge_model_missing_config(tmp_path):
+    assert jc.judge_model(tmp_path) == ''
+
+
+def test_judge_model_large_missing_value_finishes(tmp_path):
+    # The old multiline wildcard could repartition these lines exponentially.
+    (tmp_path / 'config.yaml').write_text(
+        'language_check:\n' + '  enabled: true\n' * 100_000
+        + 'other:\n  judge_model: outside\n'
+    )
+    result = subprocess.run(
+        [sys.executable, '-c',
+         'from scripts.jev_calibrate import judge_model; '
+         'import sys; assert judge_model(sys.argv[1]) == ""', str(tmp_path)],
+        capture_output=True, text=True, timeout=2,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_dry_run_and_atomic_output(tmp_path, monkeypatch, capsys):

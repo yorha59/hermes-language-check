@@ -6,17 +6,13 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hermes_constants import get_hermes_home
 from plugins.language_check.pg_events import _parameter
-try:
-    from scripts.language_rules_distill import jsonl_events
-except ImportError:
-    from language_rules_distill import jsonl_events
+from scripts.language_rules_distill import jsonl_events
 
 SQL = """SELECT id, ts, jev_conclusion, violation,
 jev_overall_confidence, jev_overall_probability
@@ -206,14 +202,25 @@ def judge_model(home=None):
         text = path.read_text(encoding='utf-8')
     except OSError:
         return ''
-    match = re.search(
-        r'(?ms)^[ \t]*language_check:[ \t]*\r?\n'
-        r'(?:^[ \t]+(?!language_check:).*\r?\n)*?'
-        r'^[ \t]+judge_model:[ \t]*([^#\r\n]+)',
-        text,
-    )
-    if match:
-        return match.group(1).strip().strip('"\'')
+    section_indent = None
+    for line in text.splitlines():
+        content = line.lstrip(' \t')
+        if not content or content.startswith('#'):
+            continue
+        indent = len(line) - len(content)
+        if section_indent is not None and indent <= section_indent:
+            section_indent = None
+        key, separator, value = content.partition(':')
+        if key == 'language_check' and separator and not value.split('#', 1)[0].strip():
+            section_indent = indent
+        elif section_indent is not None and key == 'judge_model' and separator:
+            # Comments inside quoted scalars belong to the value.
+            value = value.strip()
+            if value.startswith(('"', "'")):
+                quote = value[0]
+                end = value.find(quote, 1)
+                return value[1:end] if end != -1 else value[1:]
+            return value.split('#', 1)[0].strip()
     return ''
 
 
