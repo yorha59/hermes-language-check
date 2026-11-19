@@ -8,6 +8,9 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from zoneinfo import ZoneInfo
+
+REPORT_TZ = ZoneInfo("Asia/Shanghai")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hermes_constants import get_hermes_home
@@ -106,62 +109,63 @@ def scan(rows, score_type, minimum, target):
                 recommended_metrics=safe, thresholds=table)
 
 
+def valid_rows(rows):
+    return [r for r in rows if type(r['conclusion']) is bool and type(r['violation']) is bool
+            and all(isinstance(r.get(k), (float, int)) and math.isfinite(r[k])
+                    and 0 <= r[k] <= 1 for k in ('confidence', 'overall_probability'))]
+
+
+def row_day(row):
+    stamp = row['ts']
+    if isinstance(stamp, str):
+        stamp = datetime.fromisoformat(stamp)
+    return stamp.astimezone(REPORT_TZ).date().isoformat()
+
+
 def daily_stability(report, rows, state, now, stable_days, min_daily):
-    today = now.date().isoformat()
-    # Completed UTC days only: repeated runs cannot count partial days or advance a streak.
-    history = dict(state.get('days', {}))
-    yesterday = (now.date() - timedelta(days=1)).isoformat()
-    counts = {}
-    for row in rows:
-        stamp = row['ts']
-        if isinstance(stamp, str):
-            stamp = datetime.fromisoformat(stamp)
-        day = stamp.astimezone(UTC).date().isoformat()
-        counts[day] = counts.get(day, 0) + 1
+    today = now.astimezone(REPORT_TZ).date()
+    yesterday = (today - timedelta(days=1)).isoformat()
+    # Discard legacy UTC/cumulative recommendations: they cannot establish a daily streak.
+    history = dict(state.get('days', {})) if state.get('tz') == REPORT_TZ.key else {}
     recommendation = [report['recommended_score_type'], report['recommended_escalation_threshold']]
-    history[yesterday] = dict(recommendation=recommendation, new_samples=counts.get(yesterday, 0))
+    history[yesterday] = dict(recommendation=recommendation, new_samples=len(rows))
     streak = 0
-    day = now.date() - timedelta(days=1)
+    day = today - timedelta(days=1)
     if recommendation[1] is not None:
         while (entry := history.get(day.isoformat())):
             if entry['recommendation'] != recommendation or entry['new_samples'] < min_daily:
                 break
             streak += 1
             day -= timedelta(days=1)
-    daily_rows = []
-    for row in rows:
-        stamp = row['ts']
-        if isinstance(stamp, str):
-            stamp = datetime.fromisoformat(stamp)
-        if stamp.astimezone(UTC).date().isoformat() == yesterday:
-            daily_rows.append(row)
-    daily_metrics = (metrics(daily_rows, recommendation[0], recommendation[1], len(daily_rows))
-                     if recommendation[1] is not None else report)
-    report['daily'] = dict(new_samples=counts.get(yesterday, 0), date=yesterday,
-        **{k: daily_metrics[k] for k in ('trusted_coverage', 'agreement',
+    report['daily'] = dict(new_samples=len(rows), date=yesterday,
+        **{k: report[k] for k in ('trusted_coverage', 'agreement',
            'violation_precision_lower_95', 'ok_precision_lower_95')})
     report['stability'] = dict(stable_days=streak, required_stable_days=stable_days,
                               ready_to_stop_training=streak >= stable_days)
-    cutoff = (now.date() - timedelta(days=max(stable_days+2, 32))).isoformat()
-    return dict(schema_version=1, days={k: v for k, v in history.items() if cutoff <= k < today})
+    cutoff = (today - timedelta(days=max(stable_days+2, 32))).isoformat()
+    return dict(schema_version=1, tz=REPORT_TZ.key,
+                days={k: v for k, v in history.items() if cutoff <= k < today.isoformat()})
 
 
 def calibrate(rows, *, minimum=50, target=0.98, now=None, state=None,
               stable_days=7, min_daily=50):
-    rows = [r for r in rows if type(r['conclusion']) is bool and type(r['violation']) is bool
-            and all(isinstance(r.get(k), (float, int)) and math.isfinite(r[k])
-                    and 0 <= r[k] <= 1 for k in ('confidence', 'overall_probability'))]
+    rows = valid_rows(rows)
+    lifetime_sample_count = len(rows)
+    now = now or datetime.now(UTC)
+    yesterday = (now.astimezone(REPORT_TZ).date() - timedelta(days=1)).isoformat()
+    rows = [r for r in rows if row_day(r) == yesterday]
     channels = {k: scan(rows, k, minimum, target) for k in ('confidence', 'overall_probability')}
     candidates = [k for k, c in channels.items() if c['recommended_metrics'] is not None]
     best = max(candidates, key=lambda k: channels[k]['recommended_metrics']['trusted_coverage']) if candidates else 'confidence'
     selected = channels[best]
     m = selected['recommended_metrics'] or dict(trusted_coverage=0.0, agreement=0.0,
                  violation_precision_lower_95=None, ok_precision_lower_95=None)
-    now = now or datetime.now(UTC)
     model = judge_model()
     label = judge_label(model)
     report = dict(schema_version=1, generated_at=now.isoformat(), reference='judge_violation',
                   judge_model=model or label, judge_label=label,
+                  window=dict(tz=REPORT_TZ.key, date=yesterday, sample_count=len(rows)),
+                  lifetime_sample_count=lifetime_sample_count,
                   sample_count=len(rows), recommended_score_type=best,
                   recommended_escalation_threshold=selected['recommended_escalation_threshold'],
                   status=selected['status'] if candidates else (
@@ -231,6 +235,7 @@ def judge_label(model=None):
 
 
 def summary_text(report, rows, label=None):
+    rows = [r for r in valid_rows(rows) if row_day(r) == report['window']['date']]
     n = len(rows)
     label = label or report.get('judge_label') or judge_label()
     judge_v = sum(r['violation'] for r in rows)
@@ -263,7 +268,7 @@ def summary_text(report, rows, label=None):
         '',
         f"推荐复审阈值: {report['recommended_score_type']}≥{thr}",
         f"可信覆盖率: {report['trusted_coverage']:.1%} | 可结束训练: {report['stability']['ready_to_stop_training']}",
-        f"昨日新增: {report['daily']['new_samples']}",
+        f"统计日: {report['window']['date']} ({report['window']['tz']})",
     ]
     if thr is None:
         lines.append(f'说明: 样本不足或未达安全阈值，继续全量 {label} 复审。')

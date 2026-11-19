@@ -145,7 +145,8 @@ def test_judge_model_large_missing_value_finishes(tmp_path):
 
 
 def test_dry_run_and_atomic_output(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(jc, 'read_events', lambda: rows())
+    current_rows = rows(day=datetime.now(UTC)-timedelta(days=1))
+    monkeypatch.setattr(jc, 'read_events', lambda: current_rows)
     output = tmp_path/'nested'/'calibration.json'
     assert jc.main(['--dry-run', '--output', str(output)]) == 0
     assert not output.parent.exists()
@@ -213,7 +214,9 @@ def test_daily_metrics_use_completed_day_only():
     report, _ = jc.calibrate(old+new, now=NOW, target=.7)
     assert report['daily']['new_samples'] == 100
     assert report['daily']['agreement'] == 0
-    assert report['agreement'] > .8
+    assert report['agreement'] == 0
+    assert report['sample_count'] == 100
+    assert report['status'] == 'no_safe_threshold'
 
 
 @pytest.mark.parametrize('host', [None, ''])
@@ -239,7 +242,7 @@ def test_jsonl_calibration_without_pg_import(tmp_path, monkeypatch, capsys, host
     assert '样本: 0' in capsys.readouterr().out
     log = tmp_path / 'logs' / 'language-check.jsonl'
     log.parent.mkdir()
-    event = dict(hook='jev_training', jev_training_status='trained', ts=NOW.isoformat(),
+    event = dict(hook='jev_training', jev_training_status='trained', ts=(datetime.now(UTC)-timedelta(days=1)).isoformat(),
                  violation=True, jev_conclusion=True, jev_overall_confidence=.9,
                  jev_overall_probability=.8)
     invalid = [dict(event, hook='jev_shadow'), dict(event, jev_training_status='pending'),
@@ -255,3 +258,61 @@ def test_jsonl_calibration_without_pg_import(tmp_path, monkeypatch, capsys, host
     assert len(jc.read_events()) == 1
     assert jc.main(['--dry-run', '--log-path', str(log), '--json']) == 0
     assert '"sample_count": 1' in capsys.readouterr().out
+
+
+def test_primary_metrics_and_summary_use_yesterday_only():
+    yesterday = rows(400) + rows(100, .2, .1, False)
+    data = rows(1000, correct=False, day=NOW-timedelta(days=2)) + yesterday + rows(50, day=NOW)
+    report, _ = jc.calibrate(data, now=NOW)
+    expected, _ = jc.calibrate(yesterday, now=NOW)
+    for key in ('sample_count', 'channels', 'agreement', 'status', 'trusted_coverage',
+                'recommended_escalation_threshold', 'recommended_score_type'):
+        assert report[key] == expected[key]
+    assert report['window'] == dict(tz='Asia/Shanghai', date='2026-11-12', sample_count=500)
+    assert report['lifetime_sample_count'] == 1550
+    text = jc.summary_text(report, data)
+    assert text == jc.summary_text(expected, yesterday)
+    assert '样本: 500' in text
+    assert '混淆矩阵: TP=200 FP=50 TN=200 FN=50' in text
+    assert '一致率: 80.0%' in text
+    assert 'conf≥0.5: n=400 一致=100.0%' in text
+    assert '统计日: 2026-11-12 (Asia/Shanghai)' in text
+    assert '昨日新增' not in text
+
+
+def test_shanghai_midnight_and_stability_keys():
+    now = datetime.fromisoformat('2026-11-18T17:10:00+00:00')
+    boundary = datetime.fromisoformat('2026-11-17T16:00:00+00:00')
+    data = rows(400, day=boundary-timedelta(microseconds=1))
+    _, state = jc.calibrate(data, now=now-timedelta(days=1))
+    assert set(state['days']) == {'2026-11-17'}
+    data += rows(200, day=boundary.isoformat())
+    data += rows(200, day=datetime.fromisoformat('2026-11-17T20:00:00+00:00'))
+    data += rows(20, correct=False, day=datetime.fromisoformat('2026-11-18T16:00:00+00:00'))
+    report, state = jc.calibrate(data, now=now, state=state, stable_days=2)
+    assert report['window']['date'] == '2026-11-18'
+    assert report['sample_count'] == 400
+    assert report['stability']['stable_days'] == 2
+    assert report['stability']['ready_to_stop_training']
+    assert set(state['days']) == {'2026-11-17', '2026-11-18'}
+    assert state['tz'] == 'Asia/Shanghai'
+
+
+def test_empty_yesterday_does_not_fall_back_to_lifetime():
+    data = rows(800, day=NOW-timedelta(days=2))
+    report, _ = jc.calibrate(data, now=NOW)
+    assert report['sample_count'] == report['window']['sample_count'] == 0
+    assert report['status'] == 'collecting'
+    assert report['recommended_escalation_threshold'] is None
+    assert report['trusted_coverage'] == 0
+    text = jc.summary_text(report, data)
+    assert '样本: 0' in text
+    assert '混淆矩阵: TP=0 FP=0 TN=0 FN=0' in text
+
+
+def test_legacy_cumulative_state_does_not_extend_daily_streak():
+    legacy = dict(schema_version=1, days={
+        '2026-11-11': dict(recommendation=['confidence', 0.0], new_samples=400)})
+    report, state = jc.calibrate(rows(400), now=NOW, state=legacy)
+    assert report['stability']['stable_days'] == 1
+    assert set(state['days']) == {'2026-11-12'}
